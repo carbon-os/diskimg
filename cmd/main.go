@@ -8,6 +8,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskimg"
+	"github.com/carbon-os/diskimg/fs"
 )
 
 func main() {
@@ -19,14 +20,14 @@ func main() {
 	imgPath := os.Args[1]
 	command := os.Args[2]
 
-	// Attach opens the named disk image and parses its partition table[cite: 1].
-	// No data is read into memory; it only builds the region map[cite: 10].
+	// Attach opens the named disk image and parses its partition table.
+	// No data is read into memory; it only builds the region map.
 	img, err := diskimg.Attach(imgPath)
 	if err != nil {
 		log.Fatalf("Failed to attach image: %v", err)
 	}
 
-	// Ensure we detach and flush any changes in-place before exiting[cite: 4, 10].
+	// Ensure we detach and flush any changes in-place before exiting.
 	defer func() {
 		if err := img.Detach(""); err != nil {
 			log.Fatalf("Error during detach: %v", err)
@@ -48,13 +49,13 @@ func main() {
 		targetPath := os.Args[4]
 
 		// Mount partition 1 by default. This detects the filesystem (e.g., Ext4, FAT32) 
-		// and returns a Volume backed by a SectionReader[cite: 3, 10].
+		// and returns a Volume backed by a SectionReader.
 		vol, err := img.Mount(1)
 		if err != nil {
 			log.Fatalf("Failed to mount partition 1: %v", err)
 		}
 		
-		// Unmount flushes the journal, syncs dirty blocks, and releases the volume[cite: 5, 10].
+		// Unmount flushes the journal, syncs dirty blocks, and releases the volume.
 		defer func() {
 			if err := vol.Unmount(); err != nil {
 				log.Fatalf("Error unmounting volume: %v", err)
@@ -70,11 +71,11 @@ func main() {
 	}
 }
 
-// handleFSCommand mirrors standard os.* operations through the unified Volume interface[cite: 5, 10].
-func handleFSCommand(vol diskimg.Volume, cmd, path string) {
+// handleFSCommand mirrors standard os.* operations through the unified Volume interface.
+func handleFSCommand(vol fs.Volume, cmd, path string) {
 	switch cmd {
 	case "ls":
-		// ReadDir reads the directory named by name and returns sorted entries[cite: 5, 10].
+		// ReadDir reads the directory named by name and returns sorted entries.
 		entries, err := vol.ReadDir(path)
 		if err != nil {
 			log.Fatalf("ls failed: %v", err)
@@ -89,15 +90,15 @@ func handleFSCommand(vol diskimg.Volume, cmd, path string) {
 		w.Flush()
 
 	case "mkdir":
-		// MkdirAll creates a directory and all parents as needed[cite: 5, 10].
+		// MkdirAll creates a directory and all parents as needed.
 		if err := vol.MkdirAll(path, 0755); err != nil {
 			log.Fatalf("mkdir failed: %v", err)
 		}
 		fmt.Printf("Created directory: %s\n", path)
 
 	case "cat":
-		// ReadFile reads the named file and returns its contents[cite: 5, 10].
-		// For larger files, you would use vol.Open() to stream it[cite: 10].
+		// ReadFile reads the named file and returns its contents.
+		// For larger files, you would use vol.Open() to stream it.
 		data, err := vol.ReadFile(path)
 		if err != nil {
 			log.Fatalf("cat failed: %v", err)
@@ -105,7 +106,7 @@ func handleFSCommand(vol diskimg.Volume, cmd, path string) {
 		os.Stdout.Write(data)
 
 	case "rm":
-		// RemoveAll removes a path and all children, like rm -rf[cite: 5, 10].
+		// RemoveAll removes a path and all children, like rm -rf.
 		if err := vol.RemoveAll(path); err != nil {
 			log.Fatalf("rm failed: %v", err)
 		}
@@ -125,7 +126,7 @@ func handleFSCommand(vol diskimg.Volume, cmd, path string) {
 		}
 		defer src.Close()
 		
-		// Create creates or truncates the named file, returning a handle for streaming[cite: 5, 10].
+		// Create creates or truncates the named file, returning a handle for streaming.
 		dst, err := vol.Create(imgDest)
 		if err != nil {
 			log.Fatalf("Failed to create file on image: %v", err)
@@ -144,13 +145,13 @@ func handleFSCommand(vol diskimg.Volume, cmd, path string) {
 
 func printDiskInfo(img *diskimg.Image) {
 	fmt.Println("=== Partitions ===")
-	// Partitions returns the parsed partition list[cite: 1].
+	// Partitions returns the parsed partition list.
 	partitions := img.Partitions()
 	if len(partitions) == 0 {
 		fmt.Println("No partitions found.")
 	}
 	for _, p := range partitions {
-		// Uses the Partition struct from the partition package[cite: 7].
+		// Uses the Partition struct from the partition package.
 		guidStr := ""
 		if p.TypeGUID != "" {
 			guidStr = fmt.Sprintf(" | GUID: %s", p.TypeGUID)
@@ -159,7 +160,7 @@ func printDiskInfo(img *diskimg.Image) {
 	}
 
 	fmt.Println("\n=== Disk Layout (Regions) ===")
-	// Regions returns the ordered region map[cite: 1].
+	// Regions returns the ordered region map.
 	for _, r := range img.Regions() {
 		kindStr := "Unknown"
 		switch r.Kind {
@@ -172,7 +173,7 @@ func printDiskInfo(img *diskimg.Image) {
 		case diskimg.RegionBackup:
 			kindStr = "Backup (GPT Header)"
 		}
-		// Uses the Region struct from the region package[cite: 2].
+		// Uses the Region struct from the region package.
 		fmt.Printf("[%010d - %010d] Size: %-10d | %s\n", r.Start, r.End, r.Size(), kindStr)
 	}
 }
