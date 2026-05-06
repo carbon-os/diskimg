@@ -1,253 +1,114 @@
 # diskimg
 
-Pure-Go library for reading, extracting, and rebuilding raw disk images (`.img`)
-— no external tools, no root access, no CGo.
+Pure-Go disk image manipulation. Attach, mount, edit, detach. 
+No root. No kernel. No VM. Works natively on Linux, macOS, and Windows[cite: 10].
 
-```bash
-go get github.com/carbon-os/diskimg
-```
-
----
-
-## Overview
-
-`diskimg` gives you a surgical view of a disk image as an ordered list of
-**slices** — contiguous byte ranges that together cover every byte of the file.
-Slices that fall outside the target partition (boot gap, GPT headers,
-inter-partition gaps) are never touched: they are copied verbatim into the
-rebuilt image. Only the filesystem contents of the chosen partition are
-extracted or replaced.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  gap (boot)  │  partition 1  │  partition 2  │  tail (GPT)  │
-│  verbatim ✓  │   extracted   │  verbatim ✓   │  verbatim ✓  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-This design preserves:
-
-- **GRUB `core.img`** embedded in the boot gap
-- Exact partition byte offsets (bootloader block references stay valid)
-- GPT primary and backup headers
-- Any inter-partition alignment padding
-
----
+`diskimg` allows you to programmatically or via CLI interact with disk images (MBR and GPT)[cite: 1]. It parses partition tables, detects filesystems (ext4, FAT32/16/12)[cite: 6], and lets you stream reads and writes directly to partitions without ever loading the full image into memory[cite: 10]. 
 
 ## Features
 
-| Area | Details |
-|---|---|
-| Partition tables | GPT, MBR, raw (whole-image fallback) |
-| Filesystems | ext4 (extent tree, htree directories, indirect block map), FAT32 |
-| Extraction | Streams filesystem contents to a `tar.Writer` |
-| Rebuild | Replaces one partition from an `io.Reader`; all other bytes copied verbatim |
-| Dependencies | Zero external binaries; pure Go |
+* **Zero Root/Kernel Dependencies:** Does not require loopback devices (`losetup`), `mount`, or elevated privileges[cite: 10].
+* **Ultra-Low Memory Footprint:** Reads and writes use a fixed `SectionReader` and 32KB buffers[cite: 4, 10]. A 20GB partition modification takes only kilobytes of RAM[cite: 10].
+* **Familiar API:** The `Volume` interface mirrors the standard `os` and `io/fs` packages exactly (`ReadFile`, `OpenFile`, `MkdirAll`, etc.)[cite: 5, 10].
+* **Safe Detach:** Changes are journaled and flushed. You can detach in-place or write to a new image, leaving the original perfectly intact[cite: 4, 10].
 
----
-
-## Package Layout
-
-```
-diskimg/
-├── diskimg.go          # Image open/close, partition detection, ExtractPartition
-├── slice.go            # Slice types and buildSlices()
-├── rebuild.go          # Rebuild() and copyRange() helpers
-│
-├── partition/
-│   ├── partition.go    # Shared Partition struct and TableType constants
-│   ├── gpt/            # GPT parser
-│   └── mbr/            # MBR parser
-│
-├── fstype/             # Filesystem signature detection
-├── ext4/               # ext4 superblock, extent tree, htree, extraction
-├── fat/                # FAT32 open and extraction
-│
-└── cmd/
-    └── main.go         # img2tar CLI (info / extract / rebuild)
+## Installation
+```bash
+go get [github.com/carbon-os/diskimg](https://github.com/carbon-os/diskimg)
 ```
 
----
+## CLI Usage
 
-## Quick Start
+The package comes with a built-in CLI for inspecting and modifying images directly.
+```bash
+# View disk layout, regions, and partition tables
+./diskimg debian.img --info
 
-### Open an image and inspect it
+# List files on Partition 1
+./diskimg debian.img --fs ls "/"
 
+# Create a directory
+./diskimg debian.img --fs mkdir "/opt/myapp"
+
+# Copy a file from your host machine into the disk image
+./diskimg debian.img --fs put ./local_app.tar.gz "/opt/myapp/app.tar.gz"
+```
+
+## Go Library Usage
+
+The API is designed so anyone who knows standard Go already knows how to use it[cite: 10].
 ```go
-img, err := diskimg.Open("debian.img")
-if err != nil {
-    log.Fatal(err)
-}
-defer img.Close()
+package main
 
-fmt.Println("Table :", img.TableType())   // "gpt" | "mbr" | "raw"
-fmt.Println("Size  :", img.Size())
+import (
+    "fmt"
+    "io"
+    "log"
+    "os"
 
-for _, p := range img.Partitions() {
-    ft, _ := img.DetectFilesystem(p.Index)
-    fmt.Printf("  [%d] start=%-12s size=%-12s fs=%s  name=%q\n",
-        p.Index,
-        humanBytes(p.StartBytes),
-        humanBytes(p.SizeBytes),
-        ft, p.Name,
-    )
-}
-```
+    "github.com/carbon-os/diskimg"
+)
 
-### Extract a partition to a tar archive
+func main() {
+    // 1. Attach the image (parses MBR/GPT)
+    img, err := diskimg.Attach("debian.img")
+    if err != nil {
+        log.Fatal(err)
+    }
+    // Detach saves changes. Provide a path for a new file, or "" for in-place.
+    defer img.Detach("out.img")
 
-```go
-f, err := os.Create("rootfs.tar")
-if err != nil {
-    log.Fatal(err)
-}
-defer f.Close()
+    // 2. Mount a partition (1-based index)
+    vol, err := img.Mount(1)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer vol.Unmount()
 
-tw := tar.NewWriter(f)
-defer tw.Close()
+    // 3. Interact using standard os.* style methods
+    
+    // Simple writes
+    vol.WriteFile("etc/motd", []byte("Welcome to diskimg!\n"), 0644)
+    vol.MkdirAll("opt/myapp", 0755)
 
-// Extract partition 1 (verbose = true prints every file)
-if err := img.ExtractPartition(1, tw, true); err != nil {
-    log.Fatal(err)
-}
-```
+    // Stream large files directly without buffering the whole file in memory
+    f, _ := vol.Create("opt/myapp/rootfs.tar")
+    src, _ := os.Open("rootfs.tar")
+    io.Copy(f, src)
+    f.Close()
 
-### Rebuild an image with a modified partition
+    // Read back data
+    data, _ := vol.ReadFile("etc/os-release")
+    fmt.Println(string(data))
 
-```go
-newData, err := os.Open("rootfs-modified.tar")
-if err != nil {
-    log.Fatal(err)
-}
-defer newData.Close()
-
-// Replace partition 1; every other byte is copied verbatim.
-if err := img.Rebuild("debian-patched.img", 1, newData); err != nil {
-    log.Fatal(err)
+    // List directories
+    entries, _ := vol.ReadDir("etc")
+    for _, e := range entries {
+        fmt.Println(e.Name())
+    }
 }
 ```
 
-> **Size contract** — `newPartData` must produce **exactly** as many bytes as
-> the original partition. `Rebuild` returns an error if the byte counts differ,
-> because writing a different number of bytes would make the partition table
-> inconsistent.
+## How It Works
 
----
+`diskimg` operates in four layers to ensure memory safety and zero OS-level dependencies[cite: 10]:
 
-## Slice Map
+1. **Attach (Container Layer):** Opens the file handle, parses the GPT or MBR partition table, and maps out the disk regions (Boot, Partition, Gap, Backup)[cite: 1, 10]. No data is read into memory; it's just math on offsets[cite: 10].
+2. **Mount (Block Layer):** Looks up the requested partition, detects the filesystem (e.g., ext4 via magic bytes at byte 1080)[cite: 6], and builds an `io.SectionReader` over that exact byte range[cite: 3, 10].
+3. **Volume (Filesystem Layer):** Reads and writes translate directly into filesystem block allocations and inode updates[cite: 10]. It only reads the blocks it touches.
+4. **Detach (Flush Layer):** Walks the region map in order. It unmounts all volumes to flush dirty blocks, then safely copies the regions (including untouched GRUB and GPT backup headers) to the destination using a strict 32 KB memory buffer[cite: 4, 10].
 
-Every byte in the image belongs to exactly one slice. The four slice kinds are:
+## Memory Profile
 
-| Kind | Description |
-|---|---|
-| `SliceKindGap` | Before the first partition — boot code, MBR, GPT primary header |
-| `SliceKindPartition` | A filesystem partition |
-| `SliceKindBetween` | Gap between two consecutive partitions |
-| `SliceKindTail` | After the last partition — GPT backup header |
+Because it relies heavily on standard interfaces and section readers, the memory footprint is exceptionally low[cite: 10]:
 
-```go
-for _, sl := range img.Slices() {
-    fmt.Printf("0x%08X – 0x%08X  %-16s  %s\n",
-        sl.Start, sl.End, sl.Kind, humanBytes(sl.Size()))
-}
-```
-
-`Rebuild` iterates this slice list directly: partition slices receive new data,
-everything else is `io.Copy`-ed from the source file at the identical byte
-offset.
-
----
-
-## CLI — `img2tar`
-
-A small reference CLI lives in `cmd/`. Build it with:
-
-```bash
-go build -o img2tar ./cmd
-```
-
-**Inspect an image**
-
-```bash
-./img2tar info debian.img
-```
-```
-Image : debian.img
-Size  : 2.0 GiB (2147483648 bytes)
-Table : gpt
-Sector: 512 bytes
-
-#  START    SIZE     FILESYSTEM  NAME
-1  1.0 MiB  512 MiB  vfat        EFI System
-2  513 MiB  1.5 GiB  ext4        root
-
-KIND               START       END         SIZE
-gap (boot)         0x00000000  0x00100000  1.0 MiB
-partition 1        0x00100000  0x20100000  512.0 MiB
-partition 2        0x20100000  0x80000000  1.5 GiB
-tail (GPT backup)  0x80000000  0x80000200  512 B
-```
-
-**Extract partition 2 to a tar file**
-
-```bash
-./img2tar extract debian.img -p 2 -o rootfs.tar -v
-```
-
-**Rebuild with a modified rootfs**
-
-```bash
-./img2tar rebuild debian.img -p 2 -i rootfs-modified.tar -o debian-patched.img
-```
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `-p` | `1` | Partition number (1-based) |
-| `-o` | `partitionN.tar` / `rebuilt.img` | Output file |
-| `-i` | — | Input tar (rebuild only, required) |
-| `-v` | `false` | Print each file during extraction |
-
----
-
-## Error Handling
-
-All public functions return descriptive, wrapped errors suitable for use with
-`errors.Is` / `errors.As`. Every error string is prefixed with the package name:
-
-```
-diskimg: open "missing.img": no such file or directory
-diskimg: partition 5 out of range (1–2)
-diskimg: rebuild: new partition data is 1073741824 bytes, need 536870912
-```
-
----
-
-## Limitations & Roadmap
-
-- Rebuild **does not resize** partitions or rewrite the partition table.
-  New data must match the original partition size exactly.
-- ext4 write support (rebuilding the filesystem from a tar) is not yet
-  implemented; `Rebuild` accepts a pre-built filesystem image via `io.Reader`.
-- LUKS / LVM / btrfs / XFS are not yet supported.
-- Sparse image formats (QCOW2, VMDK) are not supported; convert to raw first
-  with `qemu-img convert -f qcow2 -O raw input.qcow2 output.img`.
-
----
-
-## Contributing
-
-```bash
-git clone https://github.com/carbon-os/diskimg
-cd diskimg
-go test ./...
-```
-
-Please open an issue before sending a pull request for anything beyond a
-bug fix — especially for new filesystem or partition-table backends, where
-the scope is easy to underestimate.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+| Operation              | Memory footprint |
+|------------------------|------------------|
+| Attach                 | ~few KB          |
+| Mount                  | ~few KB          |
+| ReadFile (small)       | file size        |
+| Open + stream (large)  | ~32KB buffer     |
+| WriteFile (small)      | file size        |
+| Create + stream (large)| ~32KB buffer     |
+| Detach                 | ~32KB buffer     |
+| **20GB partition**     | **never in RAM** |
