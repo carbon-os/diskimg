@@ -7,7 +7,6 @@ import (
 	"os"
 	"path"
 	"strings"
-	"time"
 
 	volfs "github.com/carbon-os/diskimg/fs"
 )

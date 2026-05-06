@@ -32,7 +32,7 @@ func (img *Image) Mount(index int) (fs.Volume, error) {
 	var vol fs.Volume
 	switch ft {
 	case fstype.Ext4:
-		vol, err = ext4.Open(sr)
+		vol, err = ext4.Open(img.f, region.Start, region.Size())
 	case fstype.FAT32, fstype.FAT16, fstype.FAT12:
 		// Pass the full image file + partition bounds so fat32 can flush writes.
 		vol, err = fat32.Open(img.f, region.Start, region.Size(), ft)

@@ -9,8 +9,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	volfs "github.com/carbon-os/diskimg/fs"
 )
 
 // ── extent tree traversal ─────────────────────────────────────────────────────
@@ -471,7 +469,7 @@ func (d *ext4DirEntry) Info() (fs.FileInfo, error) {
 
 // ── ext4File ──────────────────────────────────────────────────────────────────
 
-// ext4File implements fs.File and volfs.fileBackend.
+// ext4File implements fs.File and fileBackend.
 type ext4File struct {
 	v        *Volume
 	num      uint32

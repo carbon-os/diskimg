@@ -5,7 +5,7 @@ import (
 	"sort"
 )
 
-// Unmount flushes all dirty blocks and inodes to the underlying SectionReader,
+// Unmount flushes all dirty blocks and inodes to the underlying backend,
 // then releases all in-memory state.
 func (v *Volume) Unmount() error {
 	v.mu.Lock()
@@ -37,21 +37,8 @@ func (v *Volume) flush() error {
 
 	for _, blk := range keys {
 		data := v.dirty[blk]
-		off := int64(blk) * int64(v.sb.blockSize)
-		if _, err := v.sr.Seek(off, 0); err != nil {
-			return fmt.Errorf("ext4: flush block %d seek: %w", blk, err)
-		}
-		// SectionReader doesn't implement Write, so we use the underlying writer.
-		// We need a WriteAt; assert the inner type.
-		if wa, ok := v.sr.GetAt().(interface{ WriteAt([]byte, int64) (int, error) }); ok {
-			if _, err := wa.WriteAt(data, off); err != nil {
-				return fmt.Errorf("ext4: flush block %d write: %w", blk, err)
-			}
-		} else {
-			// Fallback: write via pwrite-style method on the inner reader.
-			if err := v.writeBlockDirect(blk, data); err != nil {
-				return err
-			}
+		if err := v.writeBlockDirect(blk, data); err != nil {
+			return err
 		}
 		delete(v.dirty, blk)
 	}
@@ -82,12 +69,10 @@ func (v *Volume) flushInode(num uint32, raw []byte) error {
 	return nil
 }
 
-// writeBlockDirect writes data directly to the SectionReader's backing store
+// writeBlockDirect writes data directly to the backing store
 // at the given block position.
 func (v *Volume) writeBlockDirect(blk uint64, data []byte) error {
 	off := int64(blk) * int64(v.sb.blockSize)
-	// The SectionReader wraps an io.ReaderAt; for write we need io.WriterAt.
-	// We store the raw WriterAt alongside the reader.
 	if v.wa == nil {
 		return fmt.Errorf("ext4: no writable backend (read-only image?)")
 	}

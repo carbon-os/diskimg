@@ -28,9 +28,9 @@ const (
 	inodeFirstUser = 11
 
 	// i_flags bits.
-	inodeFlagExtents   = 0x00080000
-	inodeFlagInline    = 0x10000000
-	inodeFlagHugeFile  = 0x00040000
+	inodeFlagExtents  = 0x00080000
+	inodeFlagInline   = 0x10000000
+	inodeFlagHugeFile = 0x00040000
 
 	// i_mode type bits.
 	modeFmt  = 0xF000
@@ -94,21 +94,21 @@ type superblock struct {
 
 // groupDesc holds the decoded fields of a block group descriptor.
 type groupDesc struct {
-	blockBitmapLo   uint32
-	inodeBitmapLo   uint32
-	inodeTableLo    uint32
-	freeBlocksLo    uint16
-	freeInodesLo    uint16
-	usedDirsLo      uint16
-	flags           uint16
-	blockBitmapHi   uint32
-	inodeBitmapHi   uint32
-	inodeTableHi    uint32
-	freeBlocksHi    uint16
-	freeInodesHi    uint16
-	usedDirsHi      uint16
-	itableUnusedLo  uint16
-	checksum        uint16
+	blockBitmapLo  uint32
+	inodeBitmapLo  uint32
+	inodeTableLo   uint32
+	freeBlocksLo   uint16
+	freeInodesLo   uint16
+	usedDirsLo     uint16
+	flags          uint16
+	blockBitmapHi  uint32
+	inodeBitmapHi  uint32
+	inodeTableHi   uint32
+	freeBlocksHi   uint16
+	freeInodesHi   uint16
+	usedDirsHi     uint16
+	itableUnusedLo uint16
+	checksum       uint16
 }
 
 // inode is the in-memory representation of an ext4 inode.
@@ -129,10 +129,10 @@ type inode struct {
 	fileAclLo  uint32
 	sizeHi     uint32
 	// osd2 sub-fields
-	blocksHi  uint16
-	fileAclHi uint16
-	uidHi     uint16
-	gidHi     uint16
+	blocksHi   uint16
+	fileAclHi  uint16
+	uidHi      uint16
+	gidHi      uint16
 	checksumLo uint16
 	// extra fields (inode size > 128)
 	extraIsize  uint16
@@ -156,10 +156,10 @@ type extentHeader struct {
 
 // extentIdx is a 12-byte internal (index) node of the extent B-tree.
 type extentIdx struct {
-	block   uint32 // first file block covered
-	leafLo  uint32
-	leafHi  uint16
-	unused  uint16
+	block  uint32 // first file block covered
+	leafLo uint32
+	leafHi uint16
+	unused uint16
 }
 
 // extentLeaf is a 12-byte leaf node of the extent B-tree.
@@ -175,6 +175,8 @@ type Volume struct {
 	mu sync.Mutex
 
 	sr       *io.SectionReader // raw partition access
+	wa       io.WriterAt       // backing writer for flush ops
+	srOffset int64             // base byte offset
 	sb       superblock
 	groups   []groupDesc
 
@@ -185,17 +187,23 @@ type Volume struct {
 	// dirty inode cache: inodeNum → raw 256-byte inode bytes
 	dirtyInodes map[uint32][]byte
 
-	castagnoliTable *crc32.Hash32 // for metadata checksums
+	castagnoliTable *crc32.Table // for metadata checksums
 }
 
-// Open parses the ext4 superblock and group descriptors from sr and returns a
-// ready-to-use Volume.
-func Open(sr *io.SectionReader) (*Volume, error) {
+// Open parses the ext4 superblock and group descriptors from the given bounds
+// and returns a ready-to-use Volume.
+func Open(ra io.ReaderAt, offset, size int64) (*Volume, error) {
 	v := &Volume{
-		sr:          sr,
+		sr:          io.NewSectionReader(ra, offset, size),
 		dirty:       make(map[uint64][]byte),
 		dirtyInodes: make(map[uint32][]byte),
 	}
+	// Plumb the underlying writer if possible so we can flush updates
+	if wa, ok := ra.(io.WriterAt); ok {
+		v.wa = wa
+		v.srOffset = offset
+	}
+
 	if err := v.readSuperblock(); err != nil {
 		return nil, err
 	}
