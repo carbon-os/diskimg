@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/carbon-os/diskimg/ext4"
 	"github.com/carbon-os/diskimg/fat"
