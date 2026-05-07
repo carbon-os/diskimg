@@ -220,7 +220,9 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 	for i := 0; i < count && pos < len(raw); i++ {
 		nameLen := int(raw[pos])
 		pos++
-		pos += 2 // Skip offset[2] (in sf entries, offset is BEFORE the name)
+		
+		// THE FIX: In XFS short-form entries, the 2-byte offset is BEFORE the name!
+		pos += 2 
 		
 		if pos+nameLen > len(raw) {
 			break
