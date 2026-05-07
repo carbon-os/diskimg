@@ -7,9 +7,20 @@ import (
 )
 
 // Unmount flushes all dirty state to the backing store and releases memory.
+//
+// When called on a subvolume (one created via OpenSubvol), the flush is
+// delegated to the parent Volume so the root tree and superblock are written
+// exactly once by the owner of the backing writer.
 func (v *Volume) Unmount() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+
+	if v.parent != nil {
+		// Subvolume: hand off to the parent which owns the writer.
+		v.parent.mu.Lock()
+		defer v.parent.mu.Unlock()
+		return v.parent.flush()
+	}
 	return v.flush()
 }
 
@@ -49,14 +60,12 @@ func (v *Volume) updateRootItem() error {
 	key := btrfsKey{objectID: objFSTree, itemType: typeRootItem, offset: 0}
 	data, ok, err := v.searchTree(v.rootTreeRoot, key)
 	if err != nil || !ok || len(data) < rootItemBytNrOff+8 {
-		return err // nothing to update or tree unreadable
+		return err
 	}
 	current := binary.LittleEndian.Uint64(data[rootItemBytNrOff:])
 	if current == v.fsTreeRoot {
-		return nil // no change
+		return nil
 	}
-
-	// Patch bytenr in the ROOT_ITEM payload and re-insert.
 	binary.LittleEndian.PutUint64(data[rootItemBytNrOff:], v.fsTreeRoot)
 	return v.btreeInsert(&v.rootTreeRoot, key, data, v.sb.generation+1)
 }
@@ -65,24 +74,15 @@ func (v *Volume) updateRootItem() error {
 // generation and recomputed checksum.
 func (v *Volume) writeSuperblock() error {
 	buf := make([]byte, sbSize)
-	// Read the existing superblock so we preserve fields we don't track.
 	if _, err := v.sr.ReadAt(buf, sbOffset); err != nil {
 		return fmt.Errorf("btrfs: read sb for update: %w", err)
 	}
 	le := binary.LittleEndian
 
-	// Bump generation.
 	newGen := v.sb.generation + 1
 	le.PutUint64(buf[0x48:], newGen)
-
-	// Update root tree root pointer (may have changed due to splits).
 	le.PutUint64(buf[0x50:], v.rootTreeRoot)
 
-	// Update bytes_used: old value + number of new dirty bytes.
-	// (Simplified: add nodeSize * number of newly allocated nodes.)
-	// For correctness we just leave bytes_used as-is; the kernel recalculates.
-
-	// Recompute checksum.
 	v.checksumSuperblock(buf)
 
 	if _, err := v.wa.WriteAt(buf, v.srOff+sbOffset); err != nil {

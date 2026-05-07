@@ -12,6 +12,8 @@
 //    allocator.  Checksums are recomputed on every dirty node at flush.
 //  • Full leaf splits are implemented; internal-node splits are deferred
 //    (extremely rare for image-building workloads).
+//  • Subvolumes are opened via OpenSubvol; the resulting Volume shares the
+//    parent's dirty cache and writer so a single Unmount flushes everything.
 package btrfs
 
 import (
@@ -30,8 +32,8 @@ import (
 // ── on-disk constants ────────────────────────────────────────────────────────
 
 const (
-	sbOffset   = 0x10000   // primary superblock at 64 KiB
-	sbSize     = 0x1000    // superblock occupies 4 KiB
+	sbOffset   = 0x10000    // primary superblock at 64 KiB
+	sbSize     = 0x1000     // superblock occupies 4 KiB
 	btrfsMagic = "_BHRfS_M" // at superblock+0x40
 
 	nodeHdrSize  = 101 // 0x65 – node header in bytes
@@ -258,9 +260,9 @@ func decodeInodeItem(src []byte) inodeItem {
 
 // Volume implements fs.Volume for a Btrfs partition.
 type Volume struct {
-	mu  sync.Mutex
-	sr  *io.SectionReader
-	wa  io.WriterAt
+	mu    sync.Mutex
+	sr    *io.SectionReader
+	wa    io.WriterAt
 	srOff int64 // partition start in underlying file
 
 	sb     superblock
@@ -271,10 +273,11 @@ type Volume struct {
 	fsTreeRoot   uint64
 
 	// Dirty block cache: physical offset → nodeSize bytes.
+	// Shared with parent when this is a subvolume so a single flush covers all
+	// writes regardless of which Volume they went through.
 	dirty map[int64][]byte
 
 	// High-water allocator: next free physical/logical byte for new nodes.
-	// For single-device images we treat logical == physical past srOff.
 	allocPtr uint64
 
 	// Next available objectID in the FS tree.
@@ -284,6 +287,11 @@ type Volume struct {
 	dirSeq map[uint64]uint64
 
 	crcTable *crc32.Table
+
+	// parent is non-nil when this Volume was created via OpenSubvol.
+	// Unmount delegates flush to the parent so the root tree and superblock
+	// are written exactly once, by the owner of the backing writer.
+	parent *Volume
 }
 
 // Open parses the Btrfs superblock and tree metadata from the given partition
@@ -311,6 +319,110 @@ func Open(ra io.ReaderAt, offset, size int64) (*Volume, error) {
 	v.allocPtr = v.findAllocPtr()
 	v.nextObjID = v.scanMaxObjID() + 1
 	return v, nil
+}
+
+// OpenSubvol returns a new Volume scoped to the named subvolume.
+//
+// The subvolume is located by scanning DIR_INDEX entries in the current
+// volume's FS tree for an entry whose location key has itemType ==
+// typeRootItem, then resolving that objectID to its tree root via the
+// root tree.  The returned Volume shares the parent's dirty cache and
+// writer; calling Unmount on it flushes through the parent.
+func (v *Volume) OpenSubvol(name string) (*Volume, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	rootLogical, err := v.findSubvolByName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	sub := &Volume{
+		sr:           v.sr,
+		wa:           v.wa,
+		srOff:        v.srOff,
+		sb:           v.sb,
+		chunks:       v.chunks, // slice header copy; underlying array shared
+		rootTreeRoot: v.rootTreeRoot,
+		fsTreeRoot:   rootLogical,
+		dirty:        v.dirty, // shared — writes from either Volume flush together
+		dirSeq:       make(map[uint64]uint64),
+		crcTable:     v.crcTable,
+		parent:       v,
+	}
+	sub.allocPtr = sub.findAllocPtr()
+	sub.nextObjID = sub.scanMaxObjID() + 1
+	return sub, nil
+}
+
+// ListSubvols returns the names of all direct subvolumes visible in the
+// current volume's FS tree (i.e. DIR_INDEX entries pointing to ROOT_ITEMs).
+func (v *Volume) ListSubvols() ([]string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	le := binary.LittleEndian
+	var names []string
+	err := v.walkTree(v.fsTreeRoot, func(k btrfsKey, d []byte) error {
+		if k.itemType != typeDirIndex || len(d) < dirItemHdr {
+			return nil
+		}
+		loc := decodeKey(d[0:keySize])
+		if loc.itemType != typeRootItem {
+			return nil // ordinary directory entry, not a subvolume
+		}
+		nameLen := int(le.Uint16(d[27:]))
+		if 30+nameLen > len(d) {
+			return nil
+		}
+		names = append(names, string(d[30:30+nameLen]))
+		return nil
+	})
+	return names, err
+}
+
+// findSubvolByName is the un-locked core of OpenSubvol.
+// It walks the current FS tree for a DIR_INDEX entry whose name matches and
+// whose location.itemType == typeRootItem, then looks up the ROOT_ITEM in the
+// root tree to obtain the subvolume's tree-root logical address.
+func (v *Volume) findSubvolByName(name string) (uint64, error) {
+	le := binary.LittleEndian
+	var subvolObjID uint64
+
+	err := v.walkTree(v.fsTreeRoot, func(k btrfsKey, d []byte) error {
+		if k.itemType != typeDirIndex || len(d) < dirItemHdr {
+			return nil
+		}
+		loc := decodeKey(d[0:keySize])
+		if loc.itemType != typeRootItem {
+			return nil
+		}
+		nameLen := int(le.Uint16(d[27:]))
+		if 30+nameLen > len(d) {
+			return nil
+		}
+		if string(d[30:30+nameLen]) == name {
+			subvolObjID = loc.objectID
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("btrfs: scan for subvolume %q: %w", name, err)
+	}
+	if subvolObjID == 0 {
+		return 0, fmt.Errorf("btrfs: subvolume %q not found", name)
+	}
+
+	// Resolve objectID → tree root via the root tree.
+	target := btrfsKey{objectID: subvolObjID, itemType: typeRootItem, offset: 0}
+	data, ok, err := v.searchTree(v.rootTreeRoot, target)
+	if err != nil {
+		return 0, fmt.Errorf("btrfs: root tree lookup for subvolume %q: %w", name, err)
+	}
+	if !ok || len(data) < rootItemBytNrOff+8 {
+		return 0, fmt.Errorf("btrfs: ROOT_ITEM not found for subvolume %q (objectID %d)", name, subvolObjID)
+	}
+	return le.Uint64(data[rootItemBytNrOff:]), nil
 }
 
 // Type returns "btrfs".
@@ -351,9 +463,6 @@ func (v *Volume) readSuperblock() error {
 
 // ── chunk map bootstrap ───────────────────────────────────────────────────────
 
-// loadChunks builds the full logical→physical map by first parsing the
-// sys_chunk_array in the superblock (needed to bootstrap the chunk tree),
-// then reading all CHUNK_ITEMs from the chunk tree itself.
 func (v *Volume) loadChunks() error {
 	if err := v.parseSysChunkArray(); err != nil {
 		return err
@@ -361,8 +470,6 @@ func (v *Volume) loadChunks() error {
 	return v.loadChunkTree()
 }
 
-// parseSysChunkArray decodes the (KEY, CHUNK_ITEM)* pairs stored inside the
-// superblock at offset 0x32b, covering exactly sysArrSize bytes.
 func (v *Volume) parseSysChunkArray() error {
 	buf := make([]byte, sbSize)
 	if _, err := v.sr.ReadAt(buf, sbOffset); err != nil {
@@ -372,7 +479,6 @@ func (v *Volume) parseSysChunkArray() error {
 	pos := 0
 	le := binary.LittleEndian
 	for pos+keySize < len(arr) {
-		// Skip the 17-byte key.
 		pos += keySize
 		if pos+chunkItemBase > len(arr) {
 			break
@@ -382,7 +488,7 @@ func (v *Volume) parseSysChunkArray() error {
 		if pos+itemLen > len(arr) {
 			break
 		}
-		logicalStart := le.Uint64(arr[pos-keySize+9:]) // offset field of key
+		logicalStart := le.Uint64(arr[pos-keySize+9:])
 		length := le.Uint64(arr[pos:])
 		physStart := uint64(0)
 		if numStripes > 0 {
@@ -394,8 +500,6 @@ func (v *Volume) parseSysChunkArray() error {
 	return nil
 }
 
-// loadChunkTree reads CHUNK_ITEM entries from the chunk tree, filling in
-// mappings for all data and metadata chunks not already covered.
 func (v *Volume) loadChunkTree() error {
 	return v.walkTree(v.sb.chunkLogical, func(k btrfsKey, data []byte) error {
 		if k.itemType != typeChunkItem {
@@ -420,7 +524,7 @@ func (v *Volume) loadChunkTree() error {
 func (v *Volume) addChunk(logStart, length, physStart uint64) {
 	for _, c := range v.chunks {
 		if c.logStart == logStart {
-			return // already present
+			return
 		}
 	}
 	v.chunks = append(v.chunks, chunkMap{logStart: logStart, length: length, physStart: physStart})
@@ -428,8 +532,6 @@ func (v *Volume) addChunk(logStart, length, physStart uint64) {
 
 // ── FS tree root ──────────────────────────────────────────────────────────────
 
-// findFSTreeRoot locates the default FS tree by reading ROOT_ITEM for
-// objectID 5 (BTRFS_FS_TREE_OBJECTID) from the root tree.
 func (v *Volume) findFSTreeRoot() error {
 	target := btrfsKey{objectID: objFSTree, itemType: typeRootItem, offset: 0}
 	data, ok, err := v.searchTree(v.rootTreeRoot, target)
@@ -445,7 +547,6 @@ func (v *Volume) findFSTreeRoot() error {
 
 // ── allocator helpers ─────────────────────────────────────────────────────────
 
-// findAllocPtr returns the first logical address beyond all existing chunks.
 func (v *Volume) findAllocPtr() uint64 {
 	var end uint64
 	for _, c := range v.chunks {
@@ -453,12 +554,10 @@ func (v *Volume) findAllocPtr() uint64 {
 			end = c.logStart + c.length
 		}
 	}
-	// Align up to nodeSize.
 	ns := uint64(v.sb.nodeSize)
 	return (end + ns - 1) / ns * ns
 }
 
-// scanMaxObjID walks the FS tree to find the highest object ID currently in use.
 func (v *Volume) scanMaxObjID() uint64 {
 	var maxID uint64 = objFirstFree
 	_ = v.walkTree(v.fsTreeRoot, func(k btrfsKey, _ []byte) error {
@@ -472,8 +571,6 @@ func (v *Volume) scanMaxObjID() uint64 {
 
 // ── low-level node I/O ────────────────────────────────────────────────────────
 
-// logToPhys converts a logical Btrfs address to a physical byte offset within
-// the partition (i.e., relative to the section reader base).
 func (v *Volume) logToPhys(logical uint64) (int64, error) {
 	for _, c := range v.chunks {
 		if logical >= c.logStart && logical < c.logStart+c.length {
@@ -483,8 +580,6 @@ func (v *Volume) logToPhys(logical uint64) (int64, error) {
 	return 0, fmt.Errorf("btrfs: no chunk mapping for logical %#x", logical)
 }
 
-// readNode reads one tree node (nodeSize bytes) at the given logical address.
-// The dirty cache takes precedence over on-disk data.
 func (v *Volume) readNode(logical uint64) ([]byte, error) {
 	phys, err := v.logToPhys(logical)
 	if err != nil {
@@ -502,8 +597,6 @@ func (v *Volume) readNode(logical uint64) ([]byte, error) {
 	return buf, nil
 }
 
-// writeNode stages a node into the dirty cache (at its physical address).
-// The checksum is recomputed before staging.
 func (v *Volume) writeNode(logical uint64, data []byte) error {
 	phys, err := v.logToPhys(logical)
 	if err != nil {
@@ -516,15 +609,11 @@ func (v *Volume) writeNode(logical uint64, data []byte) error {
 	return nil
 }
 
-// allocNode allocates a fresh tree node at the next available logical address,
-// extending the chunk map if necessary, and returns (logical, zeroed buf).
 func (v *Volume) allocNode() (uint64, []byte) {
 	logical := v.allocPtr
 	ns := uint64(v.sb.nodeSize)
 	v.allocPtr += ns
 
-	// If logical falls outside all existing chunks, extend the last chunk
-	// (or create a trivial direct-mapped chunk for single-device images).
 	if _, err := v.logToPhys(logical); err != nil {
 		if len(v.chunks) > 0 {
 			last := &v.chunks[len(v.chunks)-1]
@@ -534,35 +623,31 @@ func (v *Volume) allocNode() (uint64, []byte) {
 				v.chunks = append(v.chunks, chunkMap{
 					logStart:  logical,
 					length:    ns,
-					physStart: logical, // direct 1:1 for new space
+					physStart: logical,
 				})
 			}
 		}
 	}
 
 	buf := make([]byte, v.sb.nodeSize)
-	copy(buf[32:48], v.sb.fsID[:]) // fsid
+	copy(buf[32:48], v.sb.fsID[:])
 	return logical, buf
 }
 
 // ── checksums ─────────────────────────────────────────────────────────────────
 
-// csum32 computes CRC32c of data and returns it as a little-endian uint32.
 func (v *Volume) csum32(data []byte) uint32 {
 	return crc32.Update(0, v.crcTable, data)
 }
 
-// checksumNode writes the CRC32c checksum of bytes [32:nodeSize] into bytes [0:4].
 func (v *Volume) checksumNode(data []byte) {
 	sum := v.csum32(data[32:])
 	binary.LittleEndian.PutUint32(data[0:4], sum)
-	// bytes 4-31 stay zero (csum_type 0 → only first 4 bytes used)
 	for i := 4; i < 32; i++ {
 		data[i] = 0
 	}
 }
 
-// checksumSuperblock computes and writes the CRC32c over bytes [32:0x1000].
 func (v *Volume) checksumSuperblock(buf []byte) {
 	sum := v.csum32(buf[32:sbSize])
 	binary.LittleEndian.PutUint32(buf[0:4], sum)
@@ -571,7 +656,7 @@ func (v *Volume) checksumSuperblock(buf []byte) {
 	}
 }
 
-// ── StatFS ─────────────────────────────────────────────────────────────────
+// ── StatFS ────────────────────────────────────────────────────────────────────
 
 func (v *Volume) StatFS() (volfs.VolumeInfo, error) {
 	v.mu.Lock()
@@ -586,6 +671,5 @@ func (v *Volume) StatFS() (volfs.VolumeInfo, error) {
 
 // ── time helpers ──────────────────────────────────────────────────────────────
 
-func nowSec() int64 { return time.Now().Unix() }
-
+func nowSec() int64          { return time.Now().Unix() }
 func toTime(sec int64) time.Time { return time.Unix(sec, 0) }

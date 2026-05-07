@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskimg"
+	"github.com/carbon-os/diskimg/btrfs"
 	"github.com/carbon-os/diskimg/fs"
 )
 
@@ -46,23 +47,35 @@ func main() {
 		fsCmd := os.Args[3]
 		targetPath := os.Args[4]
 
-		// Parse optional --partition N from remaining args.
+		// Parse optional --partition N and --subvol NAME from remaining args.
 		partitionIndex := 1
+		var subvol string
 		args := os.Args[5:]
 		for i := 0; i < len(args); i++ {
-			if args[i] == "--partition" && i+1 < len(args) {
+			switch args[i] {
+			case "--partition":
+				if i+1 >= len(args) {
+					log.Fatal("--partition requires a number")
+				}
 				n, err := strconv.Atoi(args[i+1])
 				if err != nil || n < 1 {
 					log.Fatalf("Invalid partition number: %s", args[i+1])
 				}
 				partitionIndex = n
-				// Remove --partition N from args so put's host/dest aren't affected.
 				args = append(args[:i], args[i+2:]...)
-				break
+				i--
+
+			case "--subvol":
+				if i+1 >= len(args) {
+					log.Fatal("--subvol requires a name")
+				}
+				subvol = args[i+1]
+				args = append(args[:i], args[i+2:]...)
+				i--
 			}
 		}
 
-		vol, err := img.Mount(partitionIndex)
+		vol, err := img.Mount(partitionIndex, diskimg.MountOptions{Subvol: subvol})
 		if err != nil {
 			log.Fatalf("Failed to mount partition %d: %v", partitionIndex, err)
 		}
@@ -73,6 +86,12 @@ func main() {
 			}
 		}()
 
+		// Special case: list available subvolumes on a Btrfs partition.
+		if fsCmd == "subvols" {
+			printSubvols(vol)
+			return
+		}
+
 		handleFSCommand(vol, fsCmd, targetPath, args)
 
 	default:
@@ -82,8 +101,29 @@ func main() {
 	}
 }
 
+// printSubvols lists Btrfs subvolumes if the volume supports it.
+func printSubvols(vol fs.Volume) {
+	type subvollister interface {
+		ListSubvols() ([]string, error)
+	}
+	lister, ok := vol.(subvollister)
+	if !ok {
+		log.Fatal("subvols: not a Btrfs volume (or subvol already selected)")
+	}
+	names, err := lister.ListSubvols()
+	if err != nil {
+		log.Fatalf("subvols: %v", err)
+	}
+	if len(names) == 0 {
+		fmt.Println("No subvolumes found.")
+		return
+	}
+	for _, n := range names {
+		fmt.Println(n)
+	}
+}
+
 // handleFSCommand mirrors standard os.* operations through the unified Volume interface.
-// extraArgs holds any arguments beyond <path> (e.g. the host src for "put").
 func handleFSCommand(vol fs.Volume, cmd, path string, extraArgs []string) {
 	switch cmd {
 	case "ls":
@@ -91,7 +131,6 @@ func handleFSCommand(vol fs.Volume, cmd, path string, extraArgs []string) {
 		if err != nil {
 			log.Fatalf("ls failed: %v", err)
 		}
-
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(w, "MODE\tNAME\tIS_DIR")
 		for _, e := range entries {
@@ -123,7 +162,7 @@ func handleFSCommand(vol fs.Volume, cmd, path string, extraArgs []string) {
 		if len(extraArgs) < 1 {
 			log.Fatal("put requires a source file from the host: --fs put <host_src> <img_dest>")
 		}
-		hostPath := path       // os.Args[4] is the host src for "put"
+		hostPath := path
 		imgDest := extraArgs[0]
 
 		src, err := os.Open(hostPath)
@@ -159,7 +198,8 @@ func printDiskInfo(img *diskimg.Image) {
 		if p.TypeGUID != "" {
 			guidStr = fmt.Sprintf(" | GUID: %s", p.TypeGUID)
 		}
-		fmt.Printf("Partition %d: Start: %010d, Size: %-10d bytes%s\n", p.Index, p.StartByte, p.SizeBytes, guidStr)
+		fmt.Printf("Partition %d: Start: %010d, Size: %-10d bytes%s\n",
+			p.Index, p.StartByte, p.SizeBytes, guidStr)
 	}
 
 	fmt.Println("\n=== Disk Layout (Regions) ===")
@@ -175,7 +215,8 @@ func printDiskInfo(img *diskimg.Image) {
 		case diskimg.RegionBackup:
 			kindStr = "Backup (GPT Header)"
 		}
-		fmt.Printf("[%010d - %010d] Size: %-10d | %s\n", r.Start, r.End, r.Size(), kindStr)
+		fmt.Printf("[%010d - %010d] Size: %-10d | %s\n",
+			r.Start, r.End, r.Size(), kindStr)
 	}
 }
 
@@ -184,8 +225,9 @@ func printUsage() {
   diskimg <image.img> --info
       Shows partition tables and region layout.
 
-  diskimg <image.img> --fs <command> <path> [--partition N]
+  diskimg <image.img> --fs <command> <path> [--partition N] [--subvol NAME]
       Executes filesystem commands on the specified partition (default: 1).
+      --subvol selects a Btrfs subvolume (e.g. "root" or "home").
 
   Available --fs commands:
       ls <path>                        List directory contents
@@ -193,10 +235,13 @@ func printUsage() {
       cat <path>                       Print file contents to stdout
       rm <path>                        Remove file or directory (recursive)
       put <host_src> <img_dest>        Stream host file into the image
+      subvols <any>                    List Btrfs subvolumes on the partition
 
   Examples:
-      diskimg ubuntu.img --fs ls /
-      diskimg ubuntu.img --fs ls /boot --partition 16
-      diskimg ubuntu.img --fs cat /etc/os-release --partition 1
+      diskimg fedora.img --fs ls / --partition 4
+      diskimg fedora.img --fs ls / --partition 4 --subvol root
+      diskimg fedora.img --fs ls /var --partition 4 --subvol root
+      diskimg fedora.img --fs subvols . --partition 4
+      diskimg fedora.img --fs cat /etc/os-release --partition 4 --subvol root
       diskimg ubuntu.img --fs put ./myfile /etc/myfile --partition 1`)
 }
