@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"path"
-	"strings"
 	"sync"
 	"time"
 
