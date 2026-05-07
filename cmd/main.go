@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskimg"
@@ -20,14 +21,11 @@ func main() {
 	imgPath := os.Args[1]
 	command := os.Args[2]
 
-	// Attach opens the named disk image and parses its partition table.
-	// No data is read into memory; it only builds the region map.
 	img, err := diskimg.Attach(imgPath)
 	if err != nil {
 		log.Fatalf("Failed to attach image: %v", err)
 	}
 
-	// Ensure we detach and flush any changes in-place before exiting.
 	defer func() {
 		if err := img.Detach(""); err != nil {
 			log.Fatalf("Error during detach: %v", err)
@@ -44,25 +42,38 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		
+
 		fsCmd := os.Args[3]
 		targetPath := os.Args[4]
 
-		// Mount partition 1 by default. This detects the filesystem (e.g., Ext4, FAT32) 
-		// and returns a Volume backed by a SectionReader.
-		vol, err := img.Mount(1)
-		if err != nil {
-			log.Fatalf("Failed to mount partition 1: %v", err)
+		// Parse optional --partition N from remaining args.
+		partitionIndex := 1
+		args := os.Args[5:]
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--partition" && i+1 < len(args) {
+				n, err := strconv.Atoi(args[i+1])
+				if err != nil || n < 1 {
+					log.Fatalf("Invalid partition number: %s", args[i+1])
+				}
+				partitionIndex = n
+				// Remove --partition N from args so put's host/dest aren't affected.
+				args = append(args[:i], args[i+2:]...)
+				break
+			}
 		}
-		
-		// Unmount flushes the journal, syncs dirty blocks, and releases the volume.
+
+		vol, err := img.Mount(partitionIndex)
+		if err != nil {
+			log.Fatalf("Failed to mount partition %d: %v", partitionIndex, err)
+		}
+
 		defer func() {
 			if err := vol.Unmount(); err != nil {
 				log.Fatalf("Error unmounting volume: %v", err)
 			}
 		}()
 
-		handleFSCommand(vol, fsCmd, targetPath)
+		handleFSCommand(vol, fsCmd, targetPath, args)
 
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
@@ -72,15 +83,15 @@ func main() {
 }
 
 // handleFSCommand mirrors standard os.* operations through the unified Volume interface.
-func handleFSCommand(vol fs.Volume, cmd, path string) {
+// extraArgs holds any arguments beyond <path> (e.g. the host src for "put").
+func handleFSCommand(vol fs.Volume, cmd, path string, extraArgs []string) {
 	switch cmd {
 	case "ls":
-		// ReadDir reads the directory named by name and returns sorted entries.
 		entries, err := vol.ReadDir(path)
 		if err != nil {
 			log.Fatalf("ls failed: %v", err)
 		}
-		
+
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(w, "MODE\tNAME\tIS_DIR")
 		for _, e := range entries {
@@ -90,15 +101,12 @@ func handleFSCommand(vol fs.Volume, cmd, path string) {
 		w.Flush()
 
 	case "mkdir":
-		// MkdirAll creates a directory and all parents as needed.
 		if err := vol.MkdirAll(path, 0755); err != nil {
 			log.Fatalf("mkdir failed: %v", err)
 		}
 		fmt.Printf("Created directory: %s\n", path)
 
 	case "cat":
-		// ReadFile reads the named file and returns its contents.
-		// For larger files, you would use vol.Open() to stream it.
 		data, err := vol.ReadFile(path)
 		if err != nil {
 			log.Fatalf("cat failed: %v", err)
@@ -106,33 +114,30 @@ func handleFSCommand(vol fs.Volume, cmd, path string) {
 		os.Stdout.Write(data)
 
 	case "rm":
-		// RemoveAll removes a path and all children, like rm -rf.
 		if err := vol.RemoveAll(path); err != nil {
 			log.Fatalf("rm failed: %v", err)
 		}
 		fmt.Printf("Removed: %s\n", path)
-		
+
 	case "put":
-		// Example: ./diskimg yourimg.img --fs put hostfile.txt /destfile.txt
-		if len(os.Args) < 6 {
+		if len(extraArgs) < 1 {
 			log.Fatal("put requires a source file from the host: --fs put <host_src> <img_dest>")
 		}
-		hostPath := os.Args[4]
-		imgDest := os.Args[5]
-		
+		hostPath := path       // os.Args[4] is the host src for "put"
+		imgDest := extraArgs[0]
+
 		src, err := os.Open(hostPath)
 		if err != nil {
 			log.Fatalf("Failed to open host file: %v", err)
 		}
 		defer src.Close()
-		
-		// Create creates or truncates the named file, returning a handle for streaming.
+
 		dst, err := vol.Create(imgDest)
 		if err != nil {
 			log.Fatalf("Failed to create file on image: %v", err)
 		}
 		defer dst.Close()
-		
+
 		if _, err := io.Copy(dst, src); err != nil {
 			log.Fatalf("Failed to copy data: %v", err)
 		}
@@ -145,13 +150,11 @@ func handleFSCommand(vol fs.Volume, cmd, path string) {
 
 func printDiskInfo(img *diskimg.Image) {
 	fmt.Println("=== Partitions ===")
-	// Partitions returns the parsed partition list.
 	partitions := img.Partitions()
 	if len(partitions) == 0 {
 		fmt.Println("No partitions found.")
 	}
 	for _, p := range partitions {
-		// Uses the Partition struct from the partition package.
 		guidStr := ""
 		if p.TypeGUID != "" {
 			guidStr = fmt.Sprintf(" | GUID: %s", p.TypeGUID)
@@ -160,7 +163,6 @@ func printDiskInfo(img *diskimg.Image) {
 	}
 
 	fmt.Println("\n=== Disk Layout (Regions) ===")
-	// Regions returns the ordered region map.
 	for _, r := range img.Regions() {
 		kindStr := "Unknown"
 		switch r.Kind {
@@ -173,7 +175,6 @@ func printDiskInfo(img *diskimg.Image) {
 		case diskimg.RegionBackup:
 			kindStr = "Backup (GPT Header)"
 		}
-		// Uses the Region struct from the region package.
 		fmt.Printf("[%010d - %010d] Size: %-10d | %s\n", r.Start, r.End, r.Size(), kindStr)
 	}
 }
@@ -183,13 +184,19 @@ func printUsage() {
   diskimg <image.img> --info
       Shows partition tables and region layout.
 
-  diskimg <image.img> --fs <command> <path> [args...]
-      Executes filesystem commands on Partition 1.
+  diskimg <image.img> --fs <command> <path> [--partition N]
+      Executes filesystem commands on the specified partition (default: 1).
 
   Available --fs commands:
-      ls <path>           List directory contents
-      mkdir <path>        Create directory and parents
-      cat <path>          Print file contents to stdout
-      rm <path>           Remove file or directory (recursive)
-      put <src> <dest>    Stream host file into the image partition`)
+      ls <path>                        List directory contents
+      mkdir <path>                     Create directory and parents
+      cat <path>                       Print file contents to stdout
+      rm <path>                        Remove file or directory (recursive)
+      put <host_src> <img_dest>        Stream host file into the image
+
+  Examples:
+      diskimg ubuntu.img --fs ls /
+      diskimg ubuntu.img --fs ls /boot --partition 16
+      diskimg ubuntu.img --fs cat /etc/os-release --partition 1
+      diskimg ubuntu.img --fs put ./myfile /etc/myfile --partition 1`)
 }
