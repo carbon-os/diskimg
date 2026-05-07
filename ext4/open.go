@@ -54,10 +54,10 @@ const (
 
 	// Superblock feature flags.
 	featureCompatHasJournal = 0x00000004
+	featureIncompatFiletype = 0x00000002
 	featureIncompatExtents  = 0x00000040
 	featureIncompat64bit    = 0x00000080
 	featureIncompatFlexBg   = 0x00000200
-	featureIncompatFiletype = 0x00000002
 
 	featureRoCompatMetaCsum = 0x00000400
 )
@@ -248,20 +248,26 @@ func (v *Volume) readSuperblock() error {
 	sb.firstIno = le.Uint32(buf[84:88])
 	sb.inodeSize = le.Uint16(buf[88:90])
 	sb.blockGroupNr = le.Uint16(buf[90:92])
-	sb.descSize = le.Uint16(buf[254:256])
 	sb.journalInum = le.Uint32(buf[224:228])
-	if sb.featureIncompat&featureIncompat64bit != 0 {
-		sb.blocksCountHi = le.Uint32(buf[336:340])
-		sb.freeBlocksHi = le.Uint32(buf[344:348])
-	}
+	
 	if sb.featureIncompat&featureIncompatFlexBg != 0 {
 		sb.logGroupsPerFlex = buf[372]
 	}
 
-	sb.blockSize = 1024 << sb.logBlockSize
-	if sb.descSize == 0 {
+	// Fix: Only parse descSize if the 64-bit feature is actually enabled. 
+	// Otherwise, force it to 32 to prevent reading garbage data.
+	if sb.featureIncompat&featureIncompat64bit != 0 {
+		sb.blocksCountHi = le.Uint32(buf[336:340])
+		sb.freeBlocksHi = le.Uint32(buf[344:348])
+		sb.descSize = le.Uint16(buf[254:256])
+		if sb.descSize == 0 {
+			sb.descSize = 64
+		}
+	} else {
 		sb.descSize = 32
 	}
+
+	sb.blockSize = 1024 << sb.logBlockSize
 
 	totalBlocks := uint64(sb.blocksCountLo) | uint64(sb.blocksCountHi)<<32
 	sb.groupCount = uint32((totalBlocks + uint64(sb.blocksPerGroup) - 1) / uint64(sb.blocksPerGroup))

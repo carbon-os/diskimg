@@ -90,7 +90,7 @@ func (v *Volume) searchExtentNode(raw []byte, logBlk uint32, inline bool) (uint6
 	}
 
 	// Internal node: find the right child to descend into.
-	// The last index whose block ≤ logBlk is the correct child.
+	// The last index whose block <= logBlk is the correct child.
 	childBlock := uint64(0)
 	found := false
 	for i := uint16(0); i < hdr.entries; i++ {
@@ -359,11 +359,8 @@ func (v *Volume) ReadDir(name string) ([]fs.DirEntry, error) {
 		if e.name == "." || e.name == ".." {
 			continue
 		}
-		ein, err := v.readInode(e.inode)
-		if err != nil {
-			continue
-		}
-		out = append(out, &ext4DirEntry{name: e.name, in: ein, inum: e.inode})
+		// Lazy-load inodes: use the fileType embedded directly in the directory entries!
+		out = append(out, &ext4DirEntry{name: e.name, inum: e.inode, ft: e.fileType, v: v})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
 	return out, nil
@@ -456,15 +453,47 @@ func inodeMode(in *inode) fs.FileMode {
 
 type ext4DirEntry struct {
 	name string
-	in   inode
 	inum uint32
+	ft   uint8
+	v    *Volume
 }
 
-func (d *ext4DirEntry) Name() string               { return d.name }
-func (d *ext4DirEntry) IsDir() bool                { return d.in.mode&modeFmt == modeDir }
-func (d *ext4DirEntry) Type() fs.FileMode          { return inodeMode(&d.in).Type() }
+func (d *ext4DirEntry) Name() string { return d.name }
+
+func (d *ext4DirEntry) IsDir() bool { return d.Type()&fs.ModeDir != 0 }
+
+func (d *ext4DirEntry) Type() fs.FileMode {
+	if d.v.sb.featureIncompat&featureIncompatFiletype != 0 {
+		switch d.ft {
+		case ftRegFile:
+			return 0
+		case ftDir:
+			return fs.ModeDir
+		case ftChrdev:
+			return fs.ModeDevice | fs.ModeCharDevice
+		case ftBlkdev:
+			return fs.ModeDevice
+		case ftFifo:
+			return fs.ModeNamedPipe
+		case ftSock:
+			return fs.ModeSocket
+		case ftSymlink:
+			return fs.ModeSymlink
+		}
+	}
+	// Fallback for older filesystems without fileType embedded
+	if in, err := d.v.readInode(d.inum); err == nil {
+		return inodeMode(&in).Type()
+	}
+	return 0
+}
+
 func (d *ext4DirEntry) Info() (fs.FileInfo, error) {
-	return &ext4FileInfo{name: d.name, in: d.in, inum: d.inum}, nil
+	in, err := d.v.readInode(d.inum)
+	if err != nil {
+		return nil, err
+	}
+	return &ext4FileInfo{name: d.name, in: in, inum: d.inum}, nil
 }
 
 // ── ext4File ──────────────────────────────────────────────────────────────────
@@ -539,11 +568,7 @@ func (f *ext4File) ReadDir(n int) ([]fs.DirEntry, error) {
 		if e.name == "." || e.name == ".." {
 			continue
 		}
-		ein, err := f.v.readInode(e.inode)
-		if err != nil {
-			continue
-		}
-		out = append(out, &ext4DirEntry{name: e.name, in: ein, inum: e.inode})
+		out = append(out, &ext4DirEntry{name: e.name, inum: e.inode, ft: e.fileType, v: f.v})
 	}
 	if n > 0 && len(out) > n {
 		out = out[:n]
