@@ -51,7 +51,7 @@ func (v *Volume) parseBtreeExtents(in *inode) ([]bmbtRec, error) {
 	raw := in.literal[:in.litSize]
 	be := binary.BigEndian
 	
-	// Inode B-tree roots (xfs_bmdr_block) are exactly 4 bytes (No magic)
+	// Inode B-tree roots (xfs_bmdr_block) are exactly 4 bytes
 	if len(raw) < 4 {
 		return nil, fmt.Errorf("xfs: btree root too small")
 	}
@@ -62,9 +62,10 @@ func (v *Volume) parseBtreeExtents(in *inode) ([]bmbtRec, error) {
 		return nil, fmt.Errorf("xfs: inode btree root cannot be level 0")
 	}
 
-	// Internal node: keys start immediately at offset 4.
-	// Pointers follow the keys. Keys are 8 bytes each.
-	ptrOff := 4 + int(numrecs)*8
+	// XFS stores B-Tree pointers AFTER the maximum possible number of keys, 
+	// not the current number of keys. Each key + ptr pair is 16 bytes.
+	maxrecs := (in.litSize - 4) / 16
+	ptrOff := 4 + (maxrecs * 8)
 	
 	var recs []bmbtRec
 	for i := 0; i < int(numrecs); i++ {
@@ -300,15 +301,21 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 
 // parseDirBlock parses XFS directory entries from a raw directory block.
 func parseDirBlock(data []byte, hasFType bool) []dirEntry {
+	if len(data) < 4 {
+		return nil
+	}
 	be := binary.BigEndian
+	m := be.Uint32(data[0:4])
+
 	hdrSize := 16
-	if len(data) >= 4 {
-		m := be.Uint32(data[0:4])
-		if m == 0x58444233 { // XDB3
-			hdrSize = 64 // dir3 data block header
-		} else if m == 0x58443242 { // XD2B
-			hdrSize = 16
-		}
+	// Match both single-block (XDB3) and multi-block (XDD3) v5 magic strings
+	if m == 0x58444233 || m == 0x58444433 {
+		hdrSize = 64
+	} else if m == 0x58443242 || m == 0x58443244 { // XD2B or XD2D (v4)
+		hdrSize = 16
+	} else {
+		// Not a valid directory block (likely an unallocated hole of zeroes)
+		return nil
 	}
 
 	var entries []dirEntry
@@ -321,7 +328,7 @@ func parseDirBlock(data []byte, hasFType bool) []dirEntry {
 		if freetag == 0xFFFF {
 			length := int(be.Uint16(data[pos+2 : pos+4]))
 			if length == 0 {
-				break // Prevent infinite loop on corruption
+				break
 			}
 			pos += length
 			continue
@@ -331,18 +338,16 @@ func parseDirBlock(data []byte, hasFType bool) []dirEntry {
 		pos += 8
 		nameLen := int(data[pos])
 		pos++
-		
 		if pos+nameLen > len(data) {
 			break
 		}
 		name := string(data[pos : pos+nameLen])
 		pos += nameLen
-		
+
 		var ft uint8
-		if hasFType {
-			if pos < len(data) {
-				ft = data[pos]
-			}
+		if hasFType && pos < len(data) {
+			ft = data[pos]
+			// The position increment for ft is handled implicitly in entSize calculation
 		}
 
 		// 2. Calculate exact total size of this entry and round up to 8
@@ -351,9 +356,8 @@ func parseDirBlock(data []byte, hasFType bool) []dirEntry {
 			entSize++
 		}
 		entSize = (entSize + 7) &^ 7 // Align to 8-byte boundary
-		
+
 		pos = entStart + entSize
-		
 		entries = append(entries, dirEntry{ino: ino, name: name, fileType: ft})
 	}
 	return entries
