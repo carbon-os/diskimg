@@ -413,14 +413,12 @@ func (v *Volume) findSubvolByName(name string) (uint64, error) {
 		return 0, fmt.Errorf("btrfs: subvolume %q not found", name)
 	}
 
-	// Resolve objectID → tree root via the root tree.
-	target := btrfsKey{objectID: subvolObjID, itemType: typeRootItem, offset: 0}
-	data, ok, err := v.searchTree(v.rootTreeRoot, target)
+	_, data, err := v.findRootItem(v.rootTreeRoot, subvolObjID)
 	if err != nil {
-		return 0, fmt.Errorf("btrfs: root tree lookup for subvolume %q: %w", name, err)
+		return 0, fmt.Errorf("btrfs: root tree lookup for subvol %q: %w", name, err)
 	}
-	if !ok || len(data) < rootItemBytNrOff+8 {
-		return 0, fmt.Errorf("btrfs: ROOT_ITEM not found for subvolume %q (objectID %d)", name, subvolObjID)
+	if len(data) < rootItemBytNrOff+8 {
+		return 0, fmt.Errorf("btrfs: ROOT_ITEM invalid for subvol %q", name)
 	}
 	return le.Uint64(data[rootItemBytNrOff:]), nil
 }
@@ -533,13 +531,12 @@ func (v *Volume) addChunk(logStart, length, physStart uint64) {
 // ── FS tree root ──────────────────────────────────────────────────────────────
 
 func (v *Volume) findFSTreeRoot() error {
-	target := btrfsKey{objectID: objFSTree, itemType: typeRootItem, offset: 0}
-	data, ok, err := v.searchTree(v.rootTreeRoot, target)
+	_, data, err := v.findRootItem(v.rootTreeRoot, objFSTree)
 	if err != nil {
-		return fmt.Errorf("btrfs: read root tree: %w", err)
+		return fmt.Errorf("btrfs: read FS_TREE: %w", err)
 	}
-	if !ok || len(data) < rootItemBytNrOff+8 {
-		return fmt.Errorf("btrfs: FS_TREE ROOT_ITEM not found")
+	if len(data) < rootItemBytNrOff+8 {
+		return fmt.Errorf("btrfs: FS_TREE ROOT_ITEM invalid")
 	}
 	v.fsTreeRoot = binary.LittleEndian.Uint64(data[rootItemBytNrOff:])
 	return nil

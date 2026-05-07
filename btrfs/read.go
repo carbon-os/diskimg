@@ -393,9 +393,19 @@ func (v *Volume) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 	out := make([]fs.DirEntry, 0, len(entries))
 	for _, e := range entries {
-		ein, err := v.readInodeItem(e.location.objectID)
-		if err != nil {
-			continue
+		var ein inodeItem
+		if e.location.itemType == typeRootItem {
+			// It is a subvolume link. Fake a directory inode so it shows up in ls.
+			ein = inodeItem{
+				mode: uint32(ifdir) | 0755,
+				size: 0,
+			}
+		} else {
+			var err error
+			ein, err = v.readInodeItem(e.location.objectID)
+			if err != nil {
+				continue
+			}
 		}
 		out = append(out, &btrfsDirEntry{name: e.name, in: ein})
 	}
@@ -545,4 +555,30 @@ func pathBase(p string) string {
 		return p[i+1:]
 	}
 	return p
+}
+
+// findRootItem searches the given tree for a ROOT_ITEM matching objectID.
+// It ignores the key's offset, which Btrfs uses for transids in ROOT_ITEMs.
+func (v *Volume) findRootItem(treeRoot uint64, objectID uint64) (btrfsKey, []byte, error) {
+	var matchKey btrfsKey
+	var matchData []byte
+	err := v.walkTree(treeRoot, func(k btrfsKey, d []byte) error {
+		if k.objectID == objectID && k.itemType == typeRootItem {
+			// In case of multiple snapshots/generations, take the highest offset
+			if matchData == nil || k.offset > matchKey.offset {
+				matchKey = k
+				cpy := make([]byte, len(d))
+				copy(cpy, d)
+				matchData = cpy
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return btrfsKey{}, nil, err
+	}
+	if matchData == nil {
+		return btrfsKey{}, nil, fmt.Errorf("ROOT_ITEM for objectID %d not found", objectID)
+	}
+	return matchKey, matchData, nil
 }

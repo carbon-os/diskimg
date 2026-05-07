@@ -57,10 +57,12 @@ func (v *Volume) flush() error {
 // updateRootItem re-reads the root tree node that contains ROOT_ITEM for the
 // FS tree and patches bytenr to reflect any root change from splits.
 func (v *Volume) updateRootItem() error {
-	key := btrfsKey{objectID: objFSTree, itemType: typeRootItem, offset: 0}
-	data, ok, err := v.searchTree(v.rootTreeRoot, key)
-	if err != nil || !ok || len(data) < rootItemBytNrOff+8 {
+	key, data, err := v.findRootItem(v.rootTreeRoot, objFSTree)
+	if err != nil {
 		return err
+	}
+	if len(data) < rootItemBytNrOff+8 {
+		return fmt.Errorf("btrfs: ROOT_ITEM too small")
 	}
 	current := binary.LittleEndian.Uint64(data[rootItemBytNrOff:])
 	if current == v.fsTreeRoot {
