@@ -9,7 +9,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskimg"
-	"github.com/carbon-os/diskimg/btrfs"
 	"github.com/carbon-os/diskimg/fs"
 )
 
