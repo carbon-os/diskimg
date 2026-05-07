@@ -249,14 +249,13 @@ func (v *Volume) addDirEntryShortForm(dirIno uint64, dirIn *inode, name string, 
 	copy(raw[pos:], name)
 	pos += len(name)
 	
-	// FIXED: ino BEFORE ftype
-	be.PutUint64(raw[pos:pos+8], childIno)
-	pos += 8
-
+	// REVERTED: ftype BEFORE ino
 	if hasFType {
 		raw[pos] = ft
 		pos++
 	}
+	be.PutUint64(raw[pos:pos+8], childIno)
+	pos += 8
 	
 	raw[0]++
 	dirIn.size = int64(pos)
@@ -419,22 +418,20 @@ func (v *Volume) rebuildShortFormDir(dirIno uint64, dirIn *inode, entries []dirE
 	raw := dirIn.literal[:]
 	raw[0] = byte(len(entries))
 	
+	// Set i8count to 1 since we are unconditionally writing 64-bit inodes
 	raw[1] = 1 
-	be.PutUint64(raw[2:10], v.sb.rootIno)
+	be.PutUint64(raw[2:10], v.sb.rootIno) // 8-byte parent
 	pos := 10
 	
 	for _, e := range entries {
 		raw[pos] = byte(len(e.name))
 		pos++
-		be.PutUint16(raw[pos:pos+2], 0)
+		be.PutUint16(raw[pos:pos+2], 0) // offset BEFORE name
 		pos += 2
 		copy(raw[pos:], e.name)
 		pos += len(e.name)
-		
-		// FIXED: ino BEFORE ftype
-		be.PutUint64(raw[pos:pos+8], e.ino)
+		be.PutUint64(raw[pos:pos+8], e.ino) // ino BEFORE ftype
 		pos += 8
-
 		if hasFType {
 			raw[pos] = e.fileType
 			pos++
