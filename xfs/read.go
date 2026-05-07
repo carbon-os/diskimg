@@ -47,46 +47,25 @@ func (v *Volume) parseInlineExtents(in *inode) ([]bmbtRec, error) {
 }
 
 // parseBtreeExtents reads extents from a one-level bmbt B+tree.
-// The literal area holds the B+tree root (keys + pointers), and leaves
-// are in on-disk blocks.  For simplicity this performs a full tree walk.
 func (v *Volume) parseBtreeExtents(in *inode) ([]bmbtRec, error) {
-	// The B+tree root is at the start of the literal area.
 	raw := in.literal[:in.litSize]
 	be := binary.BigEndian
-	// First 4 bytes: magic; next 2: level; next 2: numrecs.
-	if len(raw) < 8 {
+	
+	// Inode B-tree roots (xfs_bmdr_block) are exactly 4 bytes (No magic)
+	if len(raw) < 4 {
 		return nil, fmt.Errorf("xfs: btree root too small")
 	}
-	level   := be.Uint16(raw[4:6])
-	numrecs := be.Uint16(raw[6:8])
+	level   := be.Uint16(raw[0:2])
+	numrecs := be.Uint16(raw[2:4])
 
 	if level == 0 {
-		// Inline leaf (unusual but handle it).
-		var recs []bmbtRec
-		off := 8 // after magic+level+numrecs+padding
-		// v5 has an extra 4 bytes padding in the header for alignment.
-		if v.sb.hasV5CRC {
-			off = 72 // bmbt leaf block header is 72 bytes on v5
-		}
-		for i := 0; i < int(numrecs); i++ {
-			if off+16 > len(raw) {
-				break
-			}
-			recs = append(recs, parseBmbt(raw[off:]))
-			off += 16
-		}
-		return recs, nil
+		return nil, fmt.Errorf("xfs: inode btree root cannot be level 0")
 	}
 
-	// Internal node: keys start at offset 72 (v5) or 16 (v4), ptrs after keys.
-	// For simplicity, compute the key/ptr split from numrecs.
-	hdrSize := 16
-	if v.sb.hasV5CRC {
-		hdrSize = 72
-	}
-	// Keys are 8 bytes each (logical file block offset).
-	// Ptrs are 8 bytes each (absolute block address in v5, or AG-relative in v4).
-	ptrOff := hdrSize + int(numrecs)*8
+	// Internal node: keys start immediately at offset 4.
+	// Pointers follow the keys. Keys are 8 bytes each.
+	ptrOff := 4 + int(numrecs)*8
+	
 	var recs []bmbtRec
 	for i := 0; i < int(numrecs); i++ {
 		if ptrOff+i*8+8 > len(raw) {
@@ -320,11 +299,8 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 }
 
 // parseDirBlock parses XFS directory entries from a raw directory block.
-// Works for both v4 (dir2) and v5 (dir3) formats.
 func parseDirBlock(data []byte, hasFType bool) []dirEntry {
 	be := binary.BigEndian
-	// Skip block header: 48 bytes for v5 dir3, 16 bytes for v4 dir2.
-	// We detect by magic: 0x58444233 = "XDB3" (v5), 0x58443242 = "XD2B" (v4).
 	hdrSize := 16
 	if len(data) >= 4 {
 		m := be.Uint32(data[0:4])
@@ -338,29 +314,46 @@ func parseDirBlock(data []byte, hasFType bool) []dirEntry {
 	var entries []dirEntry
 	pos := hdrSize
 	for pos+12 <= len(data) {
+		entStart := pos
+
+		// 1. Check for unused space (freetag == 0xFFFF)
+		freetag := be.Uint16(data[pos : pos+2])
+		if freetag == 0xFFFF {
+			length := int(be.Uint16(data[pos+2 : pos+4]))
+			if length == 0 {
+				break // Prevent infinite loop on corruption
+			}
+			pos += length
+			continue
+		}
+
 		ino := be.Uint64(data[pos : pos+8])
 		pos += 8
 		nameLen := int(data[pos])
 		pos++
-		if ino == 0 || nameLen == 0 {
-			// Unused entry; the record length is stored at the end.
-			// Skip to next 8-byte boundary (simple scan).
-			pos = (pos + 7) &^ 7
-			continue
-		}
+		
 		if pos+nameLen > len(data) {
 			break
 		}
 		name := string(data[pos : pos+nameLen])
 		pos += nameLen
+		
 		var ft uint8
 		if hasFType {
-			ft = data[pos]
-			pos++
+			if pos < len(data) {
+				ft = data[pos]
+			}
 		}
-		// tag (2 bytes) for alignment
-		pos = (pos + 1 + 1) &^ 1 // align to 2 bytes
-		_ = ft
+
+		// 2. Calculate exact total size of this entry and round up to 8
+		entSize := 8 + 1 + nameLen + 2 // ino + namelen + name + tag
+		if hasFType {
+			entSize++
+		}
+		entSize = (entSize + 7) &^ 7 // Align to 8-byte boundary
+		
+		pos = entStart + entSize
+		
 		entries = append(entries, dirEntry{ino: ino, name: name, fileType: ft})
 	}
 	return entries
