@@ -11,19 +11,17 @@ import (
 	"github.com/carbon-os/diskimg/partition/mbr"
 )
 
-// Image represents an attached disk image file.  All reads and writes go
-// through the underlying file handle; nothing is copied into memory.
+// Image represents an attached disk image file.
 type Image struct {
 	f          *os.File
 	size       int64
 	isGPT      bool
 	partitions []*partition.Partition
 	regions    []*Region
-	mounts     map[int]fs.Volume // key = 1-based partition index
+	mounts     map[int]fs.Volume
 }
 
 // Attach opens the named disk image and parses its partition table.
-// The file is opened read-write; call Detach to close it.
 func Attach(path string) (*Image, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -52,13 +50,24 @@ func Attach(path string) (*Image, error) {
 		img.isGPT = true
 		img.partitions = parts
 	} else {
-		// Fall back to MBR.
-		parts, err = mbr.Parse(f)
+		// Fall back to MBR, validating entries against actual disk size.
+		parts, err = mbr.Parse(f, size)
 		if err != nil {
 			f.Close()
 			return nil, fmt.Errorf("attach %s: mbr parse: %w", path, err)
 		}
 		img.partitions = parts
+	}
+
+	// If no valid partition table was found (e.g. whole-disk filesystem images
+	// like Alpine tiny, where extlinux overwrites the MBR partition entries),
+	// treat the entire image as a single partition starting at byte 0.
+	if len(img.partitions) == 0 {
+		img.partitions = []*partition.Partition{{
+			Index:     1,
+			StartByte: 0,
+			SizeBytes: size,
+		}}
 	}
 
 	img.regions = buildRegions(img.partitions, size, img.isGPT)
@@ -75,7 +84,6 @@ func (img *Image) Regions() []*Region {
 	return img.regions
 }
 
-// findPartitionRegion returns the region for the given 1-based partition index.
 func (img *Image) findPartitionRegion(index int) (*Region, error) {
 	for _, r := range img.regions {
 		if r.Kind == RegionPartition && r.PartitionIndex == index {
