@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskimg"
@@ -192,6 +193,12 @@ func printDiskInfo(img *diskimg.Image) {
 	if len(partitions) == 0 {
 		fmt.Println("No partitions found.")
 	}
+
+	// Define the interface inline just like we did for the subvols command
+	type subvollister interface {
+		ListSubvols() ([]string, error)
+	}
+
 	for _, p := range partitions {
 		guidStr := ""
 		if p.TypeGUID != "" {
@@ -199,6 +206,25 @@ func printDiskInfo(img *diskimg.Image) {
 		}
 		fmt.Printf("Partition %d: Start: %010d, Size: %-10d bytes%s\n",
 			p.Index, p.StartByte, p.SizeBytes, guidStr)
+
+		// Attempt to temporarily mount the partition to probe its filesystem
+		vol, err := img.Mount(p.Index)
+		if err == nil {
+			fmt.Printf("  └─ Filesystem: %s\n", vol.Type())
+
+			// If the filesystem supports subvolumes, list them
+			if lister, ok := vol.(subvollister); ok {
+				subs, subErr := lister.ListSubvols()
+				if subErr == nil && len(subs) > 0 {
+					// Format nicely for the CLI output
+					fmt.Printf("  └─ Subvolumes: %s\n", strings.Join(subs, ", "))
+				}
+			}
+			// Clean up the temporary mount
+			vol.Unmount()
+		} else {
+			fmt.Printf("  └─ Filesystem: unknown/unsupported\n")
+		}
 	}
 
 	fmt.Println("\n=== Disk Layout (Regions) ===")
