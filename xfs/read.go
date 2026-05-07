@@ -206,7 +206,6 @@ func (v *Volume) readDir(dirIn *inode) ([]dirEntry, error) {
 }
 
 // readDirShortForm reads entries from a short-form (inline) directory.
-// In read.go
 func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 	raw := dirIn.literal[:dirIn.litSize]
 	if len(raw) < 6 {
@@ -238,15 +237,7 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 		name := string(raw[pos : pos+nameLen])
 		pos += nameLen
 
-		// REVERTED: ftype comes BEFORE the inode!
-		var ft uint8
-		if hasFType {
-			if pos < len(raw) {
-				ft = raw[pos]
-			}
-			pos++
-		}
-
+		// FIXED: Inode comes BEFORE ftype!
 		var ino uint64
 		if i8count > 0 {
 			if pos+8 > len(raw) {
@@ -260,6 +251,15 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 			}
 			ino = uint64(be.Uint32(raw[pos : pos+4]))
 			pos += 4
+		}
+
+		// FIXED: ftype comes at the very end of the entry
+		var ft uint8
+		if hasFType {
+			if pos < len(raw) {
+				ft = raw[pos]
+			}
+			pos++
 		}
 
 		entries = append(entries, dirEntry{ino: ino, name: name, fileType: ft})
