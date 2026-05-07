@@ -13,6 +13,26 @@ import (
 
 // ── file write ────────────────────────────────────────────────────────────────
 
+// linearToFsb converts an absolute linear block number back to an xfs_fsblock_t.
+func (v *Volume) linearToFsb(blk uint64) uint64 {
+	ag := blk / uint64(v.sb.agBlocks)
+	agbno := blk % uint64(v.sb.agBlocks)
+	return (ag << uint64(v.sb.agBlkLog)) | agbno
+}
+
+// packBmbt encodes a single bmbt extent record from its four fields.
+func packBmbt(logOff, fsb uint64, count uint32, unwritten bool) bmbtRec {
+	var r bmbtRec
+	// l0: flag(1) + logOff(54) + fsb_hi(9)
+	r.l0 = (logOff << 9) | (fsb >> 43)
+	if unwritten {
+		r.l0 |= 1 << 63
+	}
+	// l1: fsb_lo(43) + count(21)
+	r.l1 = (fsb & ((1 << 43) - 1)) << 21 | uint64(count&0x1FFFFF)
+	return r
+}
+
 // writeFileRange writes data into a file at byteOffset, extending as needed.
 func (v *Volume) writeFileRange(ino uint64, in *inode, byteOffset int64, data []byte) (int, error) {
 	if len(data) == 0 {
@@ -39,7 +59,7 @@ func (v *Volume) writeFileRange(ino uint64, in *inode, byteOffset int64, data []
 		logBlk   := uint64(off / bs)
 		inBlkOff := off % bs
 
-		physBlk := logicalToPhysical(recs, logBlk)
+		physBlk := v.logicalToPhysical(recs, logBlk)
 		var blockData []byte
 		if physBlk == 0 {
 			// Allocate a new block.
@@ -48,8 +68,8 @@ func (v *Volume) writeFileRange(ino uint64, in *inode, byteOffset int64, data []
 				return total, err
 			}
 			blockData = make([]byte, bs)
-			rec := bmbtRec{}
-			rec = packBmbt(logBlk, physBlk, 1, false)
+			// Convert to structured FSB before packing the BMBT record
+			rec := packBmbt(logBlk, v.linearToFsb(physBlk), 1, false)
 			recs = append(recs, rec)
 			in.nextents++
 			if err := v.storeExtents(ino, in, recs); err != nil {
@@ -85,19 +105,6 @@ func (v *Volume) writeFileRange(ino uint64, in *inode, byteOffset int64, data []
 	return total, nil
 }
 
-// packBmbt encodes a single bmbt extent record from its four fields.
-func packBmbt(logOff, physBlk uint64, count uint32, unwritten bool) bmbtRec {
-	var r bmbtRec
-	// l0: flag(1) + logOff(54) + physBlk_hi(9)
-	r.l0 = (logOff << 9) | (physBlk >> 43)
-	if unwritten {
-		r.l0 |= 1 << 63
-	}
-	// l1: physBlk_lo(43) + count(21)
-	r.l1 = (physBlk & ((1 << 43) - 1)) << 21 | uint64(count&0x1FFFFF)
-	return r
-}
-
 // promoteLocalToExtents converts an inline (local) inode to extent format.
 func (v *Volume) promoteLocalToExtents(ino uint64, in *inode) error {
 	if in.size == 0 {
@@ -116,8 +123,8 @@ func (v *Volume) promoteLocalToExtents(ino uint64, in *inode) error {
 	copy(blk, in.literal[:in.size])
 	v.writeBlock(physBlk, blk)
 
-	// Store a single extent record.
-	rec := packBmbt(0, physBlk, 1, false)
+	// Store a single extent record, converting linear to FSB
+	rec := packBmbt(0, v.linearToFsb(physBlk), 1, false)
 	be := binary.BigEndian
 	in.format = fmtExtents
 	in.nextents = 1
@@ -186,12 +193,14 @@ func (v *Volume) spillExtentsToBtree(ino uint64, in *inode, recs []bmbtRec) erro
 	be.PutUint16(in.literal[6:8], 1) // numrecs = 1
 	// key: logical block 0
 	be.PutUint64(in.literal[8:16], 0)
-	// ptr: absolute block of leaf
+	
 	rootHdr := 16
 	if v.sb.hasV5CRC {
 		rootHdr = 72
 	}
-	be.PutUint64(in.literal[rootHdr:rootHdr+8], leafBlk)
+	
+	// Convert linear block to FSB for the child pointer
+	be.PutUint64(in.literal[rootHdr:rootHdr+8], v.linearToFsb(leafBlk))
 	in.format = fmtBtree
 	in.nextents = uint32(n)
 	return v.writeInode(ino, in)
@@ -294,7 +303,8 @@ func (v *Volume) promoteDirToExtents(dirIno uint64, dirIn *inode) error {
 	}
 	v.writeBlock(physBlk, blkData)
 
-	rec := packBmbt(0, physBlk, 1, false)
+	// Convert linear block to structured FSB
+	rec := packBmbt(0, v.linearToFsb(physBlk), 1, false)
 	dirIn.format = fmtExtents
 	dirIn.nextents = 1
 	dirIn.litSize = int(v.sb.inodeSize) - dirIn.coreSize()
@@ -316,7 +326,7 @@ func (v *Volume) addDirEntryBlock(dirIno uint64, dirIn *inode, name string, chil
 
 	// Use last extent's first block.
 	last := recs[len(recs)-1]
-	physBlk := last.startBlock()
+	physBlk := v.fsbToLinear(last.startBlock())
 	blkData, err := v.readBlock(physBlk)
 	if err != nil {
 		return err
@@ -444,7 +454,7 @@ func (v *Volume) removeDirEntryBlock(dirIno uint64, dirIn *inode, name string) e
 	for _, r := range recs {
 		cnt := uint64(r.blockCount())
 		for blkIdx := uint64(0); blkIdx < cnt; blkIdx++ {
-			physBlk := r.startBlock() + blkIdx
+			physBlk := v.fsbToLinear(r.startBlock() + blkIdx)
 			blkData, err := v.readBlock(physBlk)
 			if err != nil {
 				return err

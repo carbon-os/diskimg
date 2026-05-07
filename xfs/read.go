@@ -13,6 +13,28 @@ import (
 
 // ── extent lookup ─────────────────────────────────────────────────────────────
 
+// fsbToLinear converts an XFS structured block number (xfs_fsblock_t)
+// to a linear absolute filesystem block number.
+func (v *Volume) fsbToLinear(fsb uint64) uint64 {
+	ag := fsb >> v.sb.agBlkLog
+	agbno := fsb & ((uint64(1) << v.sb.agBlkLog) - 1)
+	return ag*uint64(v.sb.agBlocks) + agbno
+}
+
+// logicalToPhysical maps a logical file block to an absolute physical block.
+// Returns 0 for holes (unallocated).
+func (v *Volume) logicalToPhysical(recs []bmbtRec, logBlk uint64) uint64 {
+	for _, r := range recs {
+		start := r.startOff()
+		cnt   := uint64(r.blockCount())
+		if logBlk >= start && logBlk < start+cnt {
+			fsb := r.startBlock() + (logBlk - start)
+			return v.fsbToLinear(fsb)
+		}
+	}
+	return 0 // hole
+}
+
 // extentList returns all bmbt extents from the data fork of in.
 // Handles both FMT_EXTENTS (inline array) and FMT_BTREE (one B+tree level).
 func (v *Volume) extentList(in *inode) ([]bmbtRec, error) {
@@ -72,8 +94,8 @@ func (v *Volume) parseBtreeExtents(in *inode) ([]bmbtRec, error) {
 		if ptrOff+i*8+8 > len(raw) {
 			break
 		}
-		childBlk := be.Uint64(raw[ptrOff+i*8:])
-		leafRecs, err := v.readBtreeLeaf(childBlk)
+		childFsb := be.Uint64(raw[ptrOff+i*8:])
+		leafRecs, err := v.readBtreeLeaf(v.fsbToLinear(childFsb)) // Convert FSB to linear
 		if err != nil {
 			return nil, err
 		}
@@ -104,19 +126,6 @@ func (v *Volume) readBtreeLeaf(blk uint64) ([]bmbtRec, error) {
 		recs = append(recs, parseBmbt(data[off:]))
 	}
 	return recs, nil
-}
-
-// logicalToPhysical maps a logical file block to an absolute physical block.
-// Returns 0 for holes (unallocated).
-func logicalToPhysical(recs []bmbtRec, logBlk uint64) uint64 {
-	for _, r := range recs {
-		start := r.startOff()
-		cnt   := uint64(r.blockCount())
-		if logBlk >= start && logBlk < start+cnt {
-			return r.startBlock() + (logBlk - start)
-		}
-	}
-	return 0 // hole
 }
 
 // ── file data reading ─────────────────────────────────────────────────────────
@@ -150,7 +159,7 @@ func (v *Volume) readFileRange(in *inode, byteOffset int64, buf []byte) (int, er
 	for len(buf) > 0 {
 		logBlk    := uint64(byteOffset / bs)
 		inBlkOff  := byteOffset % bs
-		physBlk   := logicalToPhysical(recs, logBlk)
+		physBlk   := v.logicalToPhysical(recs, logBlk)
 
 		var blockData []byte
 		if physBlk == 0 {
@@ -281,7 +290,7 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 		var blkData []byte
 		for fsBlk := uint64(0); fsBlk < uint64(1<<v.sb.dirBlkLog); fsBlk++ {
 			logBlk := fileBlk*uint64(1<<v.sb.dirBlkLog) + fsBlk
-			physBlk := logicalToPhysical(recs, logBlk)
+			physBlk := v.logicalToPhysical(recs, logBlk)
 			var chunk []byte
 			if physBlk == 0 {
 				chunk = make([]byte, bs)
