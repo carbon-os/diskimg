@@ -242,20 +242,26 @@ type Volume struct {
 // and returns a ready-to-use Volume.
 func Open(ra io.ReaderAt, offset, size int64) (*Volume, error) {
 	v := &Volume{
-		sr:          io.NewSectionReader(ra, offset, size),
-		dirty:       make(map[uint64][]byte),
-		dirtyInodes: make(map[uint64][]byte),
+		sr:              io.NewSectionReader(ra, offset, size),
+		srOffset:        offset, // store unconditionally (needed for log replay)
+		dirty:           make(map[uint64][]byte),
+		dirtyInodes:     make(map[uint64][]byte),
 		castagnoliTable: crc32.MakeTable(crc32.Castagnoli),
 	}
 	if wa, ok := ra.(io.WriterAt); ok {
 		v.wa = wa
-		v.srOffset = offset
 	}
 	if err := v.readSuperblock(); err != nil {
 		return nil, err
 	}
 	if err := v.readAGHeaders(); err != nil {
 		return nil, err
+	}
+	if err := v.replayLog(); err != nil {
+		// Non-fatal: log replay is best-effort for read access.
+		// A failure here means the FS may appear incomplete (dirty log),
+		// but we should not block all access.
+		_ = err
 	}
 	return v, nil
 }
