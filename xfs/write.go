@@ -223,13 +223,12 @@ func (v *Volume) addDirEntry(dirIno uint64, name string, childIno uint64, ft uin
 }
 
 // addDirEntryShortForm appends a new entry to a short-form directory.
-// If the entry would not fit, the directory is promoted to extent format first.
 func (v *Volume) addDirEntryShortForm(dirIno uint64, dirIn *inode, name string, childIno uint64, ft uint8) error {
 	raw := dirIn.literal[:dirIn.litSize]
 	hasFType := v.sb.featIncompat&featIncompatFType != 0
 
-	// Entry size: 1(nameLen) + len(name) + 2(offset) + 8(ino) + 1(ftype)
-	entSize := 1 + len(name) + 2 + 8
+	// Entry size: 1(nameLen) + 2(offset) + len(name) + 8(ino) + 1(ftype)
+	entSize := 1 + 2 + len(name) + 8
 	if hasFType {
 		entSize++
 	}
@@ -247,11 +246,11 @@ func (v *Volume) addDirEntryShortForm(dirIno uint64, dirIn *inode, name string, 
 	pos := end
 	raw[pos] = byte(len(name))
 	pos++
+	be.PutUint16(raw[pos:pos+2], 0) // offset placeholder BEFORE name
+	pos += 2
 	copy(raw[pos:], name)
 	pos += len(name)
-	be.PutUint16(raw[pos:pos+2], 0) // offset placeholder
-	pos += 2
-	be.PutUint64(raw[pos:pos+8], childIno)
+	be.PutUint64(raw[pos:pos+8], childIno) // ino BEFORE ftype
 	pos += 8
 	if hasFType {
 		raw[pos] = ft
@@ -417,18 +416,20 @@ func (v *Volume) rebuildShortFormDir(dirIno uint64, dirIn *inode, entries []dirE
 	be := binary.BigEndian
 	raw := dirIn.literal[:]
 	raw[0] = byte(len(entries))
-	raw[1] = 0
-	// parent ino (8 bytes, hardcode root for simplicity)
-	be.PutUint64(raw[2:10], v.sb.rootIno)
+	
+	// Set i8count to 1 since we are unconditionally writing 64-bit inodes
+	raw[1] = 1 
+	be.PutUint64(raw[2:10], v.sb.rootIno) // 8-byte parent
 	pos := 10
+	
 	for _, e := range entries {
 		raw[pos] = byte(len(e.name))
 		pos++
+		be.PutUint16(raw[pos:pos+2], 0) // offset BEFORE name
+		pos += 2
 		copy(raw[pos:], e.name)
 		pos += len(e.name)
-		be.PutUint16(raw[pos:pos+2], 0)
-		pos += 2
-		be.PutUint64(raw[pos:pos+8], e.ino)
+		be.PutUint64(raw[pos:pos+8], e.ino) // ino BEFORE ftype
 		pos += 8
 		if hasFType {
 			raw[pos] = e.fileType

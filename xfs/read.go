@@ -230,8 +230,7 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 		nameLen := int(raw[pos])
 		pos++
 		
-		// THE FIX: In XFS short-form entries, the 2-byte offset is BEFORE the name!
-		pos += 2 
+		pos += 2 // Offset comes BEFORE the name
 		
 		if pos+nameLen > len(raw) {
 			break
@@ -239,14 +238,7 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 		name := string(raw[pos : pos+nameLen])
 		pos += nameLen
 
-		var ft uint8
-		if hasFType {
-			if pos < len(raw) {
-				ft = raw[pos]
-			}
-			pos++
-		}
-
+		// Inode comes BEFORE the ftype!
 		var ino uint64
 		if i8count > 0 {
 			if pos+8 > len(raw) {
@@ -261,6 +253,16 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 			ino = uint64(be.Uint32(raw[pos : pos+4]))
 			pos += 4
 		}
+
+		// ftype comes LAST!
+		var ft uint8
+		if hasFType {
+			if pos < len(raw) {
+				ft = raw[pos]
+			}
+			pos++
+		}
+
 		entries = append(entries, dirEntry{ino: ino, name: name, fileType: ft})
 	}
 	return entries, nil
