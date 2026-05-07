@@ -196,30 +196,20 @@ func (v *Volume) readDir(dirIn *inode) ([]dirEntry, error) {
 	}
 }
 
-// readDirShortForm parses a short-form (inline) XFS directory.
-//
-// Short-form layout in the literal area:
-//   2 bytes : count of entries
-//   1 byte  : count of entries that need 8-byte ino (i8count)
-//   8 bytes : parent ino  (or 4 bytes when i8count==0)
-//   then entries:
-//     1 byte  : name length
-//     <name>  : nameLen bytes
-//     2 bytes : offset (ignored here)
-//     4 or 8  : inode number
-//     1 byte  : file type (v5 with FTYPE feature)
+// readDirShortForm reads entries from a short-form (inline) directory.
 func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 	raw := dirIn.literal[:dirIn.litSize]
 	if len(raw) < 6 {
 		return nil, nil
 	}
 	be := binary.BigEndian
-	count   := int(raw[0])
+	count := int(raw[0])
 	i8count := int(raw[1])
-	// parent ino: 8 bytes if i8count > 0, else 4 bytes
+	
+	// If i8count > 0, the parent field is 8 bytes. Else 4 bytes.
 	var pos int
 	if i8count > 0 {
-		pos = 2 + 8 // count(1) + i8count(1) + parent(8)
+		pos = 2 + 8
 	} else {
 		pos = 2 + 4
 	}
@@ -230,15 +220,24 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 	for i := 0; i < count && pos < len(raw); i++ {
 		nameLen := int(raw[pos])
 		pos++
+		pos += 2 // Skip offset[2] (in sf entries, offset is BEFORE the name)
+		
 		if pos+nameLen > len(raw) {
 			break
 		}
 		name := string(raw[pos : pos+nameLen])
 		pos += nameLen
-		pos += 2 // skip offset field
+
+		var ft uint8
+		if hasFType {
+			if pos < len(raw) {
+				ft = raw[pos]
+			}
+			pos++
+		}
 
 		var ino uint64
-		if i8count > 0 && i < i8count {
+		if i8count > 0 {
 			if pos+8 > len(raw) {
 				break
 			}
@@ -250,14 +249,6 @@ func (v *Volume) readDirShortForm(dirIn *inode) ([]dirEntry, error) {
 			}
 			ino = uint64(be.Uint32(raw[pos : pos+4]))
 			pos += 4
-		}
-		var ft uint8
-		if hasFType {
-			if pos >= len(raw) {
-				break
-			}
-			ft = raw[pos]
-			pos++
 		}
 		entries = append(entries, dirEntry{ino: ino, name: name, fileType: ft})
 	}
@@ -276,7 +267,15 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 	hasFType := v.sb.featIncompat&featIncompatFType != 0
 
 	var entries []dirEntry
-	for fileBlk := uint64(0); int64(fileBlk)*dirBlkBytes < dirIn.size; fileBlk++ {
+	
+	// XFS directories place leaf/free-space indexes at a 32GB logical offset.
+	// Only read the data section (offset 0 up to 32GB).
+	limit := dirIn.size
+	if limit > 34359738368 {
+		limit = 34359738368
+	}
+
+	for fileBlk := uint64(0); int64(fileBlk)*dirBlkBytes < limit; fileBlk++ {
 		// Read all FS blocks that make up this directory block.
 		var blkData []byte
 		for fsBlk := uint64(0); fsBlk < uint64(1<<v.sb.dirBlkLog); fsBlk++ {
@@ -294,7 +293,9 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 			blkData = append(blkData, chunk...)
 		}
 
-		entries = append(entries, parseDirBlock(blkData, hasFType)...)
+		if ents := parseDirBlock(blkData, hasFType); ents != nil {
+			entries = append(entries, ents...)
+		}
 	}
 	return entries, nil
 }
