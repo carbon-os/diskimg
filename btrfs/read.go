@@ -582,38 +582,3 @@ func (v *Volume) findRootItem(treeRoot uint64, objectID uint64) (btrfsKey, []byt
 	}
 	return matchKey, matchData, nil
 }
-
-// ListSubvols implements the subvollister interface for the diskimg CLI.
-// It scans the filesystem tree for all subvolume references and returns their names.
-func (v *Volume) ListSubvols() ([]string, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	var names []string
-	le := binary.LittleEndian
-
-	err := v.walkTree(v.fsTreeRoot, func(k btrfsKey, d []byte) error {
-		// Subvolume links are stored as DIR_INDEX entries pointing to a ROOT_ITEM
-		if k.itemType != typeDirIndex || len(d) < dirItemHdr {
-			return nil
-		}
-		
-		loc := decodeKey(d[0:keySize])
-		if loc.itemType != typeRootItem { 
-			return nil
-		}
-
-		nameLen := int(le.Uint16(d[27:]))
-		if 30+nameLen > len(d) {
-			return nil
-		}
-		
-		names = append(names, string(d[30:30+nameLen]))
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("btrfs: failed to list subvolumes: %w", err)
-	}
-	return names, nil
-}
