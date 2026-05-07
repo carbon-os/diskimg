@@ -227,15 +227,13 @@ func (v *Volume) addDirEntryShortForm(dirIno uint64, dirIn *inode, name string, 
 	raw := dirIn.literal[:dirIn.litSize]
 	hasFType := v.sb.featIncompat&featIncompatFType != 0
 
-	// Entry size: 1(nameLen) + 2(offset) + len(name) + 8(ino) + 1(ftype)
 	entSize := 1 + 2 + len(name) + 8
 	if hasFType {
 		entSize++
 	}
 
-	end := int(dirIn.size) // current sf size (excluding inode header)
+	end := int(dirIn.size)
 	if end+entSize > dirIn.litSize {
-		// Promote to extent format.
 		if err := v.promoteDirToExtents(dirIno, dirIn); err != nil {
 			return err
 		}
@@ -246,17 +244,20 @@ func (v *Volume) addDirEntryShortForm(dirIno uint64, dirIn *inode, name string, 
 	pos := end
 	raw[pos] = byte(len(name))
 	pos++
-	be.PutUint16(raw[pos:pos+2], 0) // offset placeholder BEFORE name
+	be.PutUint16(raw[pos:pos+2], 0) // offset BEFORE name
 	pos += 2
 	copy(raw[pos:], name)
 	pos += len(name)
-	be.PutUint64(raw[pos:pos+8], childIno) // ino BEFORE ftype
-	pos += 8
+	
+	// REVERTED: ftype BEFORE ino
 	if hasFType {
 		raw[pos] = ft
 		pos++
 	}
-	raw[0]++ // increment count
+	be.PutUint64(raw[pos:pos+8], childIno)
+	pos += 8
+	
+	raw[0]++
 	dirIn.size = int64(pos)
 	return v.writeInode(dirIno, dirIn)
 }
@@ -417,24 +418,25 @@ func (v *Volume) rebuildShortFormDir(dirIno uint64, dirIn *inode, entries []dirE
 	raw := dirIn.literal[:]
 	raw[0] = byte(len(entries))
 	
-	// Set i8count to 1 since we are unconditionally writing 64-bit inodes
 	raw[1] = 1 
-	be.PutUint64(raw[2:10], v.sb.rootIno) // 8-byte parent
+	be.PutUint64(raw[2:10], v.sb.rootIno)
 	pos := 10
 	
 	for _, e := range entries {
 		raw[pos] = byte(len(e.name))
 		pos++
-		be.PutUint16(raw[pos:pos+2], 0) // offset BEFORE name
+		be.PutUint16(raw[pos:pos+2], 0)
 		pos += 2
 		copy(raw[pos:], e.name)
 		pos += len(e.name)
-		be.PutUint64(raw[pos:pos+8], e.ino) // ino BEFORE ftype
-		pos += 8
+		
+		// REVERTED: ftype BEFORE ino
 		if hasFType {
 			raw[pos] = e.fileType
 			pos++
 		}
+		be.PutUint64(raw[pos:pos+8], e.ino)
+		pos += 8
 	}
 	dirIn.size = int64(pos)
 	return v.writeInode(dirIno, dirIn)
