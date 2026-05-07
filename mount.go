@@ -9,6 +9,7 @@ import (
 	"github.com/carbon-os/diskimg/fat32"
 	"github.com/carbon-os/diskimg/fs"
 	"github.com/carbon-os/diskimg/fs/fstype"
+	"github.com/carbon-os/diskimg/xfs"
 )
 
 // MountOptions controls optional behaviour of Mount.
@@ -23,7 +24,7 @@ type MountOptions struct {
 // An optional MountOptions may be supplied to select a Btrfs subvolume.
 // The returned Volume must be Unmount()ed before Detach() is called.
 //
-//	img.Mount(4)                                     // default FS tree
+//	img.Mount(4)                                      // default FS tree
 //	img.Mount(4, diskimg.MountOptions{Subvol:"root"}) // Fedora root subvolume
 func (img *Image) Mount(index int, opts ...MountOptions) (fs.Volume, error) {
 	var opt MountOptions
@@ -69,6 +70,9 @@ func (img *Image) Mount(index int, opts ...MountOptions) (fs.Volume, error) {
 
 	case fstype.Ext4:
 		vol, err = ext4.Open(img.f, region.Start, region.Size())
+
+	case fstype.XFS:
+		vol, err = xfs.Open(img.f, region.Start, region.Size())
 
 	case fstype.FAT32, fstype.FAT16, fstype.FAT12:
 		vol, err = fat32.Open(img.f, region.Start, region.Size(), ft)
