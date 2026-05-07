@@ -110,12 +110,13 @@ func (v *Volume) readBtreeLeaf(blk uint64) ([]bmbtRec, error) {
 // Returns 0 for holes (unallocated).
 func logicalToPhysical(recs []bmbtRec, logBlk uint64) uint64 {
 	for _, r := range recs {
-		if logBlk >= r.startoff && logBlk < r.startoff+r.blockcount {
-			// Return the physical start block + how far into the extent we are
-			return r.startblock + (logBlk - r.startoff)
+		start := r.startOff()
+		cnt   := uint64(r.blockCount())
+		if logBlk >= start && logBlk < start+cnt {
+			return r.startBlock() + (logBlk - start)
 		}
 	}
-	return 0 // Unmapped (hole)
+	return 0 // hole
 }
 
 // ── file data reading ─────────────────────────────────────────────────────────
@@ -267,8 +268,7 @@ func (v *Volume) readDirBlock(dirIn *inode) ([]dirEntry, error) {
 
 	var entries []dirEntry
 	
-	// XFS directories place leaf/free-space indexes at a 32GB logical offset.
-	// Only read the data section (offset 0 up to 32GB).
+	// Ensure we don't try to parse 32GB leaf metadata as directory entries
 	limit := dirIn.size
 	if limit > 34359738368 {
 		limit = 34359738368
@@ -694,18 +694,4 @@ func pathBase(p string) string {
 		return p[i+1:]
 	}
 	return p
-}
-
-func parseBmbt(raw []byte) bmbtRec {
-	be := binary.BigEndian
-	l0 := be.Uint64(raw[0:8])
-	l1 := be.Uint64(raw[8:16])
-
-	// l0: 1 bit flag, 54 bits logical offset, 9 bits physical block (upper)
-	// l1: 43 bits physical block (lower), 21 bits block count
-	return bmbtRec{
-		startoff:   (l0 & 0x7FFFFFFFFFFFFFFF) >> 9,
-		startblock: ((l0 & 0x1FF) << 43) | (l1 >> 21),
-		blockcount: l1 & 0x1FFFFF,
-	}
 }
