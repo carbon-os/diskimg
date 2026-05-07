@@ -148,10 +148,14 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 func (v *Volume) lookupPath(p string) (*fatDirEntry, error) {
 	p = path.Clean("/" + p)
 	if p == "/" {
+		clus := v.b.firstRootDir
+		if v.b.fatType != fstype.FAT32 {
+			clus = 0 // sentinel: use fixed root-dir sector path
+		}
 		return &fatDirEntry{
 			name:    "/",
 			attr:    attrDirectory,
-			cluster: v.b.firstRootDir,
+			cluster: clus,
 		}, nil
 	}
 
