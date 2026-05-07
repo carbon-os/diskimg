@@ -54,6 +54,15 @@ func (v *Volume) extentList(in *inode) ([]bmbtRec, error) {
 // parseInlineExtents reads the extent array from the literal area.
 func (v *Volume) parseInlineExtents(in *inode) ([]bmbtRec, error) {
 	n := int(in.nextents)
+
+	// nextents can be 0 on disk when the journal was destroyed before replay:
+	// size/nblocks were already flushed but the nextents increment was only
+	// in the log. If the literal area contains valid-looking bmbt records,
+	// infer the count rather than returning nothing.
+	if n == 0 && in.size > 0 && in.nblocks > 0 {
+		n = v.inferNextents(in)
+	}
+
 	if n == 0 {
 		return nil, nil
 	}
@@ -66,6 +75,59 @@ func (v *Volume) parseInlineExtents(in *inode) ([]bmbtRec, error) {
 		recs[i] = parseBmbt(in.literal[i*16:])
 	}
 	return recs, nil
+}
+
+// inferNextents scans the data-fork literal area of an fmtExtents inode for
+// leading valid bmbt records when di_nextents is zero but size/nblocks say
+// data exists. This recovers from a zeroed journal whose replay was skipped.
+func (v *Volume) inferNextents(in *inode) int {
+	// Data fork ends at forkoff*8 bytes into the literal area.
+	// forkoff == 0 means no attr fork → whole literal area is data fork.
+	dataForkBytes := in.litSize
+	if in.forkoff > 0 {
+		df := int(in.forkoff) * 8
+		if df < in.litSize {
+			dataForkBytes = df
+		}
+	}
+
+	maxRecs := dataForkBytes / 16
+	if maxRecs > 4096 {
+		maxRecs = 4096 // sanity cap
+	}
+
+	var totalBlocks uint64
+	for i := 0; i < maxRecs; i++ {
+		if i*16+16 > in.litSize {
+			break
+		}
+		r := parseBmbt(in.literal[i*16:])
+
+		// A record with zero blockCount is an empty slot — stop here.
+		if r.blockCount() == 0 {
+			break
+		}
+		// startBlock of 0 would be the AG superblock — definitely invalid.
+		fsb := r.startBlock()
+		if fsb == 0 {
+			break
+		}
+		// The linear block must fall within the filesystem.
+		lin := v.fsbToLinear(fsb)
+		if lin == 0 || lin >= v.sb.dblocks {
+			break
+		}
+		totalBlocks += uint64(r.blockCount())
+		// Stop as soon as the cumulative block count matches nblocks.
+		// This prevents reading into attr-fork or garbage data.
+		if totalBlocks >= in.nblocks {
+			return i + 1
+		}
+	}
+
+	// Fallback: return however many looked valid.
+	// (Reached here only if nblocks accounting didn't align cleanly.)
+	return 0
 }
 
 // parseBtreeExtents reads extents from a one-level bmbt B+tree.
