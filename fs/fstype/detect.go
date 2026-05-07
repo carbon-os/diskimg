@@ -6,6 +6,7 @@ type Type string
 
 const (
 	Ext4    Type = "ext4"
+	Btrfs   Type = "btrfs"
 	FAT32   Type = "fat32"
 	FAT16   Type = "fat16"
 	FAT12   Type = "fat12"
@@ -15,6 +16,13 @@ const (
 // Detect reads magic bytes via the supplied reader to identify the
 // filesystem occupying the partition.  readAt mirrors io.ReaderAt.
 func Detect(readAt func(off int64, buf []byte) error) Type {
+	// ── Btrfs ───────────────────────────────────────────────────────
+	// Primary superblock at 0x10000; magic "_BHRfS_M" at +0x40.
+	var bm [8]byte
+	if readAt(0x10040, bm[:]) == nil && string(bm[:]) == "_BHRfS_M" {
+		return Btrfs
+	}
+
 	// ── ext4 ────────────────────────────────────────────────────────
 	// Superblock starts at byte 1024; magic uint16-LE is at +56 → byte 1080.
 	var m [2]byte
@@ -36,7 +44,6 @@ func Detect(readAt func(off int64, buf []byte) error) Type {
 	}
 	// FAT12/16 have "FAT" at offset 54.
 	if readAt(54, label[:3]) == nil && string(label[:3]) == "FAT" {
-		// Proper variant requires counting clusters; return FAT16 as default.
 		return FAT16
 	}
 	return Unknown

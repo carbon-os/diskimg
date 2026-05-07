@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/carbon-os/diskimg/btrfs"
 	"github.com/carbon-os/diskimg/ext4"
 	"github.com/carbon-os/diskimg/fat32"
 	"github.com/carbon-os/diskimg/fs"
@@ -22,7 +23,6 @@ func (img *Image) Mount(index int) (fs.Volume, error) {
 		return nil, fmt.Errorf("mount partition %d: %w", index, err)
 	}
 
-	// Temporary SectionReader for filesystem detection only.
 	sr := io.NewSectionReader(img.f, region.Start, region.Size())
 	ft := fstype.Detect(func(off int64, buf []byte) error {
 		_, err := sr.ReadAt(buf, off)
@@ -31,10 +31,11 @@ func (img *Image) Mount(index int) (fs.Volume, error) {
 
 	var vol fs.Volume
 	switch ft {
+	case fstype.Btrfs:
+		vol, err = btrfs.Open(img.f, region.Start, region.Size())
 	case fstype.Ext4:
 		vol, err = ext4.Open(img.f, region.Start, region.Size())
 	case fstype.FAT32, fstype.FAT16, fstype.FAT12:
-		// Pass the full image file + partition bounds so fat32 can flush writes.
 		vol, err = fat32.Open(img.f, region.Start, region.Size(), ft)
 	default:
 		return nil, fmt.Errorf("mount partition %d: unsupported filesystem %q", index, ft)
