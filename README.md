@@ -30,21 +30,225 @@ a unified filesystem API across ext4, Btrfs, XFS, and FAT variants.
 
 ## Installation
 
-### Library
-
 ```bash
 go get github.com/carbon-os/diskimg
 ```
 
-### CLI
+---
+
+## Library usage
+
+### Opening and closing an image
+
+```go
+// Attach opens the image file and parses its partition table (GPT or MBR).
+img, err := diskimg.Attach("ubuntu.img")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Detach unmounts all volumes, flushes all dirty blocks, and closes the file.
+// Pass "" to flush in place, or a path to write the result to a new file
+// while leaving the original untouched.
+err = img.Detach("")           // in-place
+err = img.Detach("output.img") // copy-out
+```
+
+### Inspecting partitions and regions
+
+```go
+// Partitions returns every parsed partition entry.
+for _, p := range img.Partitions() {
+    // p.Index     int    — 1-based partition number
+    // p.StartByte int64  — byte offset of the first sector
+    // p.SizeBytes int64  — total byte length
+    // p.TypeGUID  string — GPT type GUID (empty for MBR)
+    // p.Name      string — human-readable label (GPT only)
+    fmt.Printf("Partition %d  start=%d  size=%d  guid=%q  name=%q\n",
+        p.Index, p.StartByte, p.SizeBytes, p.TypeGUID, p.Name)
+}
+
+// Regions returns the ordered layout of the entire disk — boot area,
+// partitions, unallocated gaps, and the GPT backup header.
+for _, r := range img.Regions() {
+    // r.Kind           RegionKind — RegionBoot | RegionPartition | RegionGap | RegionBackup
+    // r.Start          int64
+    // r.End            int64
+    // r.PartitionIndex int        — set only for RegionPartition
+    // r.Size()         int64      — convenience: r.End - r.Start
+    fmt.Printf("kind=%d  start=%d  end=%d  size=%d\n",
+        r.Kind, r.Start, r.End, r.Size())
+}
+```
+
+### Mounting a partition
+
+```go
+// Mount mounts a partition by its 1-based index and returns a Volume.
+// The Volume must be Unmount()ed before Detach() is called.
+vol, err := img.Mount(1)
+defer vol.Unmount()
+
+// To mount a specific Btrfs subvolume, pass MountOptions.
+vol, err := img.Mount(4, diskimg.MountOptions{Subvol: "root"})
+defer vol.Unmount()
+```
+
+### Reading from a volume
+
+```go
+// ReadFile reads the entire named file and returns its contents.
+data, err := vol.ReadFile("/etc/os-release")
+
+// Open opens the named file for streaming reads. Returns an fs.File.
+f, err := vol.Open("/var/log/syslog")
+defer f.Close()
+io.Copy(os.Stdout, f)
+
+// OpenFile opens a file with explicit flags and permissions.
+// Returns a *fs.File that also implements io.Writer and io.Seeker.
+f, err := vol.OpenFile("/etc/hosts", os.O_RDONLY, 0)
+defer f.Close()
+
+// ReadDir returns the entries of a directory, matching os.ReadDir.
+entries, err := vol.ReadDir("/etc")
+for _, e := range entries {
+    info, _ := e.Info()
+    fmt.Println(e.Name(), info.Mode(), e.IsDir())
+}
+
+// Stat returns FileInfo for a path, following symlinks (like os.Stat).
+info, err := vol.Stat("/etc/hostname")
+fmt.Println(info.Size(), info.Mode(), info.ModTime())
+
+// Lstat returns FileInfo without following symlinks (like os.Lstat).
+info, err := vol.Lstat("/etc/localtime")
+
+// Readlink returns the target of a symbolic link.
+target, err := vol.Readlink("/etc/localtime")
+
+// StatFS returns capacity and inode information for the volume.
+vi, err := vol.StatFS()
+// vi.TotalBytes int64
+// vi.FreeBytes  int64
+// vi.UsedBytes  int64
+// vi.BlockSize  int64
+// vi.Inodes     int64
+// vi.InodesFree int64
+fmt.Printf("used %d of %d bytes\n", vi.UsedBytes, vi.TotalBytes)
+
+// Type returns the detected filesystem type ("ext4", "btrfs", "xfs", etc.).
+fmt.Println(vol.Type())
+```
+
+### Writing to a volume
+
+```go
+// WriteFile writes data to a file, creating it if it does not exist.
+err := vol.WriteFile("/etc/hostname", []byte("my-host\n"), 0644)
+
+// Create creates or truncates a file and returns a writable *File handle.
+f, err := vol.Create("/etc/myapp/config.yaml")
+defer f.Close()
+f.Write([]byte("key: value\n"))
+
+// OpenFile with write flags for full control over creation and truncation.
+f, err := vol.OpenFile("/var/log/app.log", os.O_WRONLY|os.O_APPEND, 0644)
+defer f.Close()
+f.Write([]byte("started\n"))
+
+// Mkdir creates a single directory.
+err := vol.Mkdir("/etc/myapp", 0755)
+
+// MkdirAll creates the directory and any missing parents (like os.MkdirAll).
+err := vol.MkdirAll("/opt/myapp/data/cache", 0755)
+
+// Remove removes a single file or empty directory.
+err := vol.Remove("/etc/myapp/old.conf")
+
+// RemoveAll removes the path and everything under it (like os.RemoveAll).
+err := vol.RemoveAll("/opt/myapp/data")
+
+// Rename renames (moves) a file or directory.
+err := vol.Rename("/etc/myapp/config.new", "/etc/myapp/config.yaml")
+
+// Symlink creates a symbolic link at newname pointing to oldname.
+err := vol.Symlink("/usr/share/zoneinfo/UTC", "/etc/localtime")
+
+// Link creates a hard link at newname pointing to oldname.
+err := vol.Link("/etc/myapp/config.yaml", "/etc/myapp/config.bak")
+```
+
+### Updating metadata
+
+```go
+// Chmod changes the permission bits of the named file.
+err := vol.Chmod("/etc/myapp/secret.key", 0600)
+
+// Chown changes the user and group ownership of the named file.
+err := vol.Chown("/var/lib/myapp", 1000, 1000)
+
+// Chtimes changes the access and modification times of the named file.
+err := vol.Chtimes("/etc/myapp/config.yaml", time.Now(), time.Now())
+```
+
+### Btrfs subvolumes
+
+```go
+// Mount the default tree first (no subvol) to enumerate subvolumes.
+base, err := img.Mount(4)
+defer base.Unmount()
+
+type subvollister interface {
+    ListSubvols() ([]string, error)
+}
+if lister, ok := base.(subvollister); ok {
+    names, err := lister.ListSubvols()
+    fmt.Println(names) // [root home]
+}
+
+// Then mount a named subvolume to operate on its tree.
+root, err := img.Mount(4, diskimg.MountOptions{Subvol: "root"})
+defer root.Unmount()
+
+data, err := root.ReadFile("/etc/passwd")
+```
+
+### Full example — patch a config and save to a new image
+
+```go
+img, err := diskimg.Attach("base.img")
+if err != nil {
+    log.Fatal(err)
+}
+
+vol, err := img.Mount(1)
+if err != nil {
+    log.Fatal(err)
+}
+
+if err := vol.WriteFile("/etc/hostname", []byte("patched-host\n"), 0644); err != nil {
+    log.Fatal(err)
+}
+if err := vol.MkdirAll("/opt/myapp", 0755); err != nil {
+    log.Fatal(err)
+}
+
+vol.Unmount()
+img.Detach("patched.img") // base.img is untouched
+```
+
+---
+
+## CLI
+
+### Installation
 
 ```bash
 go install github.com/carbon-os/diskimg/cmd/diskimg@latest
 ```
 
----
-
-## CLI usage
+### Usage
 
 ```
 diskimg <image.img> --info
@@ -119,80 +323,6 @@ diskimg ubuntu.img --fs mkdir /etc/myapp --partition 1
 
 # Remove a file or directory
 diskimg ubuntu.img --fs rm /etc/myapp --partition 1
-```
-
----
-
-## Library usage
-
-### Attach, read, detach
-
-```go
-img, err := diskimg.Attach("ubuntu.img")
-if err != nil {
-    log.Fatal(err)
-}
-defer img.Detach("") // flush in place; pass a path to write to a new file
-
-vol, err := img.Mount(1) // partition 1
-if err != nil {
-    log.Fatal(err)
-}
-defer vol.Unmount()
-
-data, err := vol.ReadFile("/etc/os-release")
-```
-
-### Write changes to a new file
-
-```go
-img, _ := diskimg.Attach("base.img")
-
-vol, _ := img.Mount(1)
-vol.WriteFile("/etc/hostname", []byte("my-host\n"), 0644)
-vol.Unmount()
-
-// Original base.img is untouched; changes go to modified.img.
-img.Detach("modified.img")
-```
-
-### Btrfs subvolumes
-
-```go
-img, _ := diskimg.Attach("fedora.img")
-defer img.Detach("")
-
-// Mount the default tree to list subvolumes.
-base, _ := img.Mount(4)
-type subvollister interface {
-    ListSubvols() ([]string, error)
-}
-if lister, ok := base.(subvollister); ok {
-    names, _ := lister.ListSubvols()
-    fmt.Println(names) // [root home]
-}
-
-// Mount a named subvolume.
-root, _ := img.Mount(4, diskimg.MountOptions{Subvol: "root"})
-defer root.Unmount()
-
-data, _ := root.ReadFile("/etc/passwd")
-```
-
-### Inspect partitions and regions
-
-```go
-img, _ := diskimg.Attach("disk.img")
-defer img.Detach("")
-
-for _, p := range img.Partitions() {
-    fmt.Printf("Partition %d  start=%d  size=%d  name=%q\n",
-        p.Index, p.StartByte, p.SizeBytes, p.Name)
-}
-
-for _, r := range img.Regions() {
-    fmt.Printf("Region kind=%d  start=%d  end=%d\n", r.Kind, r.Start, r.End)
-}
 ```
 
 ---
