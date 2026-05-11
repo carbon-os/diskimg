@@ -1,36 +1,37 @@
 # diskimg
 
-A Go library and CLI tool for reading and writing disk image files without
-mounting them via the OS. Supports GPT and MBR partition tables, and provides
-a unified filesystem API across ext4, Btrfs, XFS, and FAT variants. Includes
-a GPT image builder and low-level filesystem formatters for creating new images
-from scratch.
+A Go library and CLI for reading and writing disk image files without mounting
+them via the OS. Supports GPT and MBR partition tables and provides a unified
+filesystem API across ext4, Btrfs, XFS, and FAT variants. Includes a GPT image
+builder and low-level filesystem formatters for creating new images from scratch.
 
 ---
 
 ## Features
 
 - **Partition table parsing** — GPT (with protective MBR) and MBR
-- **Filesystem detection** — magic-byte probing at attach time; no guessing
+- **Filesystem detection** — magic-byte probing at attach time
 - **Unified `Volume` API** — mirrors `os.*` so callers need no driver knowledge
 - **Btrfs subvolume support** — mount and list named subvolumes
 - **GPT image builder** — write a new partition table to any blank file
-- **Filesystem formatters** — `mkfs.FAT32` and `mkfs.ExFAT` write directly onto raw partition streams
+- **Filesystem formatters** — `fat32.Format`, `exfat.Format`, `ntfs.Format`, and
+  `ext4.Format` write directly onto raw partition streams
 - **Safe output** — write changes to a new file, leaving the original untouched
-- **Low memory footprint** — streaming copies use a fixed 32 KB buffer; FAT
-  tables are written sector-by-sector regardless of volume size
+- **Low memory footprint** — streaming copies use a fixed 32 KiB buffer;
+  allocation tables and bitmaps are written block-by-block regardless of volume size
 
 ### Supported filesystems
 
-| Filesystem | Read | Write | Format (`mkfs`) |
-|------------|------|-------|-----------------|
-| ext4       | ✓    | ✓     | —               |
-| Btrfs      | ✓    | ✓     | —               |
-| XFS        | ✓    | ✓     | —               |
-| FAT32      | ✓    | ✓     | ✓               |
-| FAT16      | ✓    | ✓     | —               |
-| FAT12      | ✓    | ✓     | —               |
-| exFAT      | —    | —     | ✓               |
+| Filesystem | Read | Write | Format |
+|------------|:----:|:-----:|:------:|
+| ext4       | ✓    | ✓     | ✓      |
+| Btrfs      | ✓    | ✓     |        |
+| XFS        | ✓    | ✓     |        |
+| FAT32      | ✓    | ✓     | ✓      |
+| FAT16      | ✓    | ✓     |        |
+| FAT12      | ✓    | ✓     |        |
+| exFAT      |      |       | ✓      |
+| NTFS       |      |       | ✓      |
 
 ---
 
@@ -47,14 +48,12 @@ go get github.com/carbon-os/diskimg
 ### Opening and closing an existing image
 
 ```go
-// Attach opens the image file and parses its partition table (GPT or MBR).
 img, err := diskimg.Attach("ubuntu.img")
 if err != nil {
     log.Fatal(err)
 }
 
-// Detach unmounts all volumes, flushes all dirty blocks, and closes the file.
-// Pass "" to flush in place, or a path to write the result to a new file
+// Pass "" to flush in place, or a path to write to a new file
 // while leaving the original untouched.
 err = img.Detach("")           // in-place
 err = img.Detach("output.img") // copy-out
@@ -64,23 +63,13 @@ err = img.Detach("output.img") // copy-out
 
 ```go
 for _, p := range img.Partitions() {
-    // p.Index     int    — 1-based partition number
-    // p.StartByte int64  — byte offset of the first sector
-    // p.SizeBytes int64  — total byte length
-    // p.TypeGUID  string — GPT type GUID (empty for MBR)
-    // p.Name      string — human-readable label (GPT only)
-    fmt.Printf("Partition %d  start=%d  size=%d  guid=%q  name=%q\n",
+    fmt.Printf("partition %d  start=%d  size=%d  guid=%q  name=%q\n",
         p.Index, p.StartByte, p.SizeBytes, p.TypeGUID, p.Name)
 }
 
-// Regions returns the ordered layout of the entire disk — boot area,
-// partitions, unallocated gaps, and the GPT backup header.
+// Regions returns the ordered layout of the entire disk —
+// boot area, partitions, unallocated gaps, and the GPT backup header.
 for _, r := range img.Regions() {
-    // r.Kind           RegionKind — RegionBoot | RegionPartition | RegionGap | RegionBackup
-    // r.Start          int64
-    // r.End            int64
-    // r.PartitionIndex int        — set only for RegionPartition
-    // r.Size()         int64      — convenience: r.End - r.Start
     fmt.Printf("kind=%d  start=%d  end=%d  size=%d\n",
         r.Kind, r.Start, r.End, r.Size())
 }
@@ -89,80 +78,56 @@ for _, r := range img.Regions() {
 ### Mounting a partition
 
 ```go
-// Mount mounts a partition by its 1-based index and returns a Volume.
-// The Volume must be Unmount()ed before Detach() is called.
+// Mount by 1-based index; the Volume must be Unmount()ed before Detach().
 vol, err := img.Mount(1)
 defer vol.Unmount()
 
 // To mount a specific Btrfs subvolume, pass MountOptions.
-vol, err := img.Mount(4, diskimg.MountOptions{Subvol: "root"})
+vol, err = img.Mount(4, diskimg.MountOptions{Subvol: "root"})
 defer vol.Unmount()
 ```
 
 ### Reading from a volume
 
 ```go
-// ReadFile reads the entire named file and returns its contents.
 data, err := vol.ReadFile("/etc/os-release")
 
-// Open opens the named file for streaming reads.
 f, err := vol.Open("/var/log/syslog")
 defer f.Close()
 io.Copy(os.Stdout, f)
 
-// OpenFile opens a file with explicit flags and permissions.
-f, err := vol.OpenFile("/etc/hosts", os.O_RDONLY, 0)
-defer f.Close()
-
-// ReadDir returns the entries of a directory, matching os.ReadDir.
 entries, err := vol.ReadDir("/etc")
 for _, e := range entries {
     info, _ := e.Info()
     fmt.Println(e.Name(), info.Mode(), e.IsDir())
 }
 
-// Stat follows symlinks; Lstat does not.
-info, err := vol.Stat("/etc/hostname")
-info, err  = vol.Lstat("/etc/localtime")
+info, err := vol.Stat("/etc/hostname")    // follows symlinks
+info, err  = vol.Lstat("/etc/localtime") // does not follow symlinks
 
-// Readlink returns the target of a symbolic link.
 target, err := vol.Readlink("/etc/localtime")
 
-// StatFS returns capacity and inode information for the volume.
 vi, err := vol.StatFS()
-// vi.TotalBytes, vi.FreeBytes, vi.UsedBytes, vi.BlockSize, vi.Inodes, vi.InodesFree
 fmt.Printf("used %d of %d bytes\n", vi.UsedBytes, vi.TotalBytes)
 
-// Type returns the detected filesystem type ("ext4", "btrfs", "xfs", etc.).
-fmt.Println(vol.Type())
+fmt.Println(vol.Type()) // "ext4", "btrfs", "xfs", ...
 ```
 
 ### Writing to a volume
 
 ```go
-// WriteFile writes data to a file, creating it if it does not exist.
-err := vol.WriteFile("/etc/hostname", []byte("my-host\n"), 0644)
+err = vol.WriteFile("/etc/hostname", []byte("my-host\n"), 0644)
 
-// Create creates or truncates a file and returns a writable *File handle.
 f, err := vol.Create("/etc/myapp/config.yaml")
 defer f.Close()
 f.Write([]byte("key: value\n"))
 
-// OpenFile with write flags for full control over creation and truncation.
-f, err := vol.OpenFile("/var/log/app.log", os.O_WRONLY|os.O_APPEND, 0644)
+f, err = vol.OpenFile("/var/log/app.log", os.O_WRONLY|os.O_APPEND, 0644)
 defer f.Close()
-f.Write([]byte("started\n"))
 
-// MkdirAll creates the directory and any missing parents.
 err = vol.MkdirAll("/opt/myapp/data/cache", 0755)
-
-// RemoveAll removes the path and everything under it.
 err = vol.RemoveAll("/opt/myapp/data")
-
-// Rename moves a file or directory.
 err = vol.Rename("/etc/myapp/config.new", "/etc/myapp/config.yaml")
-
-// Symlink and Link create symbolic and hard links.
 err = vol.Symlink("/usr/share/zoneinfo/UTC", "/etc/localtime")
 err = vol.Link("/etc/myapp/config.yaml", "/etc/myapp/config.bak")
 ```
@@ -178,7 +143,6 @@ err = vol.Chtimes("/etc/myapp/config.yaml", time.Now(), time.Now())
 ### Btrfs subvolumes
 
 ```go
-// Mount the default tree first (no subvol) to enumerate subvolumes.
 base, err := img.Mount(4)
 defer base.Unmount()
 
@@ -186,29 +150,21 @@ type subvollister interface {
     ListSubvols() ([]string, error)
 }
 if lister, ok := base.(subvollister); ok {
-    names, err := lister.ListSubvols()
+    names, _ := lister.ListSubvols()
     fmt.Println(names) // [root home]
 }
 
-// Mount a named subvolume to operate on its tree.
 root, err := img.Mount(4, diskimg.MountOptions{Subvol: "root"})
 defer root.Unmount()
 data, err := root.ReadFile("/etc/passwd")
 ```
 
-### Patching an existing image and saving to a new file
+### Patching an existing image
 
 ```go
 img, err := diskimg.Attach("base.img")
-if err != nil {
-    log.Fatal(err)
-}
 
 vol, err := img.Mount(1)
-if err != nil {
-    log.Fatal(err)
-}
-
 vol.WriteFile("/etc/hostname", []byte("patched-host\n"), 0644)
 vol.MkdirAll("/opt/myapp", 0755)
 vol.Unmount()
@@ -220,89 +176,183 @@ img.Detach("patched.img") // base.img is left untouched
 
 ## Building new images from scratch
 
-`Builder` creates a new GPT disk image over any blank `*os.File`. After
-writing the partition table with `Commit`, `OpenRaw` returns a bounded
-`io.ReadWriteSeeker` for each partition that can be passed directly to
-`mkfs.FAT32` or `mkfs.ExFAT`. Once formatted, `Mount` works exactly like
-it does on an image opened with `Attach`.
+`Builder` creates a new GPT disk image over any blank `*os.File`. After writing
+the partition table with `Commit`, `OpenRaw` returns a bounded
+`io.ReadWriteSeeker` for each partition that can be passed directly to any of
+the `mkfs` formatters. Once formatted, `Mount` works exactly like it does on an
+image opened with `Attach`.
 
-No OS loop devices, no `hdiutil`, no root required — every byte is written
-directly by the library.
+No OS loop devices, no `hdiutil`, no root required.
 
 ### Well-known type GUIDs
 
-| Constant               | GUID                                   | Use                          |
-|------------------------|----------------------------------------|------------------------------|
-| `diskimg.GUID_EFISystem`  | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` | EFI System Partition         |
-| `diskimg.GUID_BasicData`  | `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` | Microsoft Basic Data / exFAT |
-| `diskimg.GUID_LinuxData`  | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` | Linux filesystem data        |
+| Constant              | GUID                                   | Use                              |
+|-----------------------|----------------------------------------|----------------------------------|
+| `diskimg.GUID_EFISystem`  | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` | EFI System Partition             |
+| `diskimg.GUID_BasicData`  | `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` | Microsoft Basic Data / exFAT / NTFS |
+| `diskimg.GUID_LinuxData`  | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` | Linux filesystem data (ext4, XFS, …) |
 
 ### Builder API
 
 ```go
-// NewBuilder wraps a pre-sized *os.File for GPT construction.
 img, err := diskimg.NewBuilder(f)
 
-// AddPartition queues a partition of the given type GUID.
-// Pass sizeBytes = 0 to expand the partition to fill all remaining usable space.
-// The returned *BuilderPartition pointer is updated in-place by Commit.
-p1 := img.AddPartition(diskimg.GUID_EFISystem, 512<<20) // 512 MB
-p2 := img.AddPartition(diskimg.GUID_BasicData, 0)       // rest of disk
+// sizeBytes = 0 expands the partition to fill all remaining usable space.
+p1 := img.AddPartition(diskimg.GUID_EFISystem, 512<<20)
+p2 := img.AddPartition(diskimg.GUID_LinuxData, 0)
 
 // Commit writes the protective MBR, GPT header, and partition entries.
-// After this call, p1.StartByte and p1.SizeBytes are set.
+// After this call p1.StartByte and p1.SizeBytes are populated.
 err = img.Commit()
 
-// OpenRaw returns an io.ReadWriteSeeker whose position 0 is the first byte of
-// the partition. Pass it to mkfs.FAT32 or mkfs.ExFAT.
+// OpenRaw returns an io.ReadWriteSeeker whose position 0 is the first byte
+// of the partition. Pass it to any mkfs formatter.
 raw, err := img.OpenRaw(p1.Index)
 
-// Mount works identically to Image.Mount — available after Commit.
-vol, err := img.Mount(p1.Index)
-
-// Detach flushes and closes the image (optional outPath for copy-out).
-err = img.Detach("")
+vol, err  := img.Mount(p1.Index)
+err        = img.Detach("")
 ```
 
-### `mkfs` package
+### `mkfs` formatters
+
+Each formatter lives in its own subpackage and accepts an `io.ReadWriteSeeker`
+plus a size and an options struct. All write their required structures — boot
+regions, allocation tables, bitmaps, system files and directories — in a single
+sequential pass with no intermediate allocations proportional to volume size.
 
 ```go
-import "github.com/carbon-os/diskimg/mkfs"
+import (
+    "github.com/carbon-os/diskimg/mkfs/ext4"
+    "github.com/carbon-os/diskimg/mkfs/fat32"
+    "github.com/carbon-os/diskimg/mkfs/exfat"
+    "github.com/carbon-os/diskimg/mkfs/ntfs"
+)
 
-type mkfs.Options struct {
-    Label      string // volume label
-    SectorSize int    // defaults to 512; must be a power of two in [512, 4096]
-}
+// ext4 — partition must be at least 16 MiB.
+err := ext4.Format(rw, sizeBytes, ext4.Options{Label: "ROOT"})
 
-// FAT32 formats the stream as FAT32. The partition must be at least ~32 MB
-// (65 536 sectors at 512 bytes/sector).
-err := mkfs.FAT32(rw, sizeBytes, mkfs.Options{Label: "BOOT"})
+// FAT32 — partition must be at least ~32 MiB (65 536 sectors × 512 bytes).
+err  = fat32.Format(rw, sizeBytes, fat32.Options{Label: "BOOT"})
 
-// ExFAT formats the stream as exFAT. The partition must be at least 2 048 sectors.
-err := mkfs.ExFAT(rw, sizeBytes, mkfs.Options{Label: "DATA"})
+// exFAT — partition must be at least 2 048 sectors.
+err  = exfat.Format(rw, sizeBytes, exfat.Options{Label: "DATA"})
+
+// NTFS — fully automated MFT and boot sector layout.
+err  = ntfs.Format(rw, sizeBytes, ntfs.Options{Label: "WINDOWS"})
 ```
 
-Both formatters write all required structures — VBR, FSInfo / boot checksum
-sectors, backup boot region, FAT, allocation bitmap, up-case table, and root
-directory — in a single sequential pass.
+All `Options` structs expose these common fields:
 
-### Full example — build a Windows-style dual-partition USB image
+| Field        | Type     | Default    | Description                                                |
+|--------------|----------|------------|------------------------------------------------------------|
+| `Label`      | `string` | —          | Volume label                                               |
+| `SectorSize` | `int`    | `512`      | Logical sector size; power of two in [512, 4096] *(FAT32/exFAT/NTFS only)* |
+
+`ext4.Options` also exposes:
+
+| Field         | Type     | Default | Description                                                        |
+|---------------|----------|---------|--------------------------------------------------------------------|
+| `UUID`        | `[16]byte` | random | Filesystem UUID; a random v4 UUID is generated when zero           |
+| `InodeRatio`  | `int64`  | `16384` | One inode is created per this many bytes                           |
+| `ReservedPct` | `int`    | `5`     | Percentage of blocks reserved for root                             |
+
+### ext4 feature set
+
+The ext4 formatter writes the same feature set that `mkfs.ext4` enables by
+default on modern Linux systems:
+
+| Feature              | Flag                    | Description                                             |
+|----------------------|-------------------------|---------------------------------------------------------|
+| Extent tree inodes   | `INCOMPAT_EXTENTS`      | All inodes use extent trees; no indirect block maps     |
+| 64-bit descriptors   | `INCOMPAT_64BIT`        | Group descriptors are 64 bytes; supports volumes > 8 TiB |
+| Flexible block groups | `INCOMPAT_FLEX_BG`     | Metadata aggregated in the first group of each flex group (size 16) |
+| Directory file type  | `INCOMPAT_FILETYPE`     | Directory entries record the file type                  |
+| Journal              | `COMPAT_HAS_JOURNAL`    | Empty JBD2 journal written in inode 8                   |
+| Extended attributes  | `COMPAT_EXT_ATTR`       | —                                                       |
+| Resize inode         | `COMPAT_RESIZE_INODE`   | Reserved GDT blocks allow online filesystem growth      |
+| Sparse superblocks   | `RO_COMPAT_SPARSE_SUPER`| SB backups only in groups 0, 1, and powers of 3, 5, 7  |
+| Metadata checksums   | `RO_COMPAT_METADATA_CSUM` | crc32c on superblock, all group descriptors, bitmaps, and inodes |
+| Large / huge files   | `RO_COMPAT_LARGE_FILE`, `RO_COMPAT_HUGE_FILE` | Files larger than 2 GiB / 2 TiB  |
+| Extra inode size     | `RO_COMPAT_EXTRA_ISIZE` | 28 bytes of extra inode space for nanosecond timestamps |
+
+### Full example — Linux boot image
 
 ```go
 package main
 
 import (
-    "io"
     "log"
     "os"
 
     "github.com/carbon-os/diskimg"
-    "github.com/carbon-os/diskimg/mkfs"
+    "github.com/carbon-os/diskimg/mkfs/ext4"
+    "github.com/carbon-os/diskimg/mkfs/fat32"
 )
 
 func main() {
-    // 1. Create a raw blank 8 GB image.
-    f, err := os.Create("windows-unattended.img")
+    f, err := os.Create("linux.img")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer f.Close()
+    if err := f.Truncate(8 << 30); err != nil { // 8 GiB
+        log.Fatal(err)
+    }
+
+    img, err := diskimg.NewBuilder(f)
+    if err != nil {
+        log.Fatal(err)
+    }
+    efi  := img.AddPartition(diskimg.GUID_EFISystem, 512<<20)  // 512 MiB
+    root := img.AddPartition(diskimg.GUID_LinuxData, 0)         // fills rest
+    if err := img.Commit(); err != nil {
+        log.Fatal(err)
+    }
+
+    rawEFI, _ := img.OpenRaw(efi.Index)
+    if err := fat32.Format(rawEFI, efi.SizeBytes, fat32.Options{Label: "EFI"}); err != nil {
+        log.Fatal(err)
+    }
+
+    rawRoot, _ := img.OpenRaw(root.Index)
+    if err := ext4.Format(rawRoot, root.SizeBytes, ext4.Options{
+        Label:       "ROOT",
+        InodeRatio:  16384,
+        ReservedPct: 5,
+    }); err != nil {
+        log.Fatal(err)
+    }
+
+    vol, err := img.Mount(root.Index)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer vol.Unmount()
+
+    vol.MkdirAll("/etc", 0755)
+    vol.MkdirAll("/var/log", 0755)
+    vol.WriteFile("/etc/hostname", []byte("myhost\n"), 0644)
+
+    img.Detach("linux.img")
+}
+```
+
+### Full example — dual-partition Windows image
+
+```go
+package main
+
+import (
+    "log"
+    "os"
+
+    "github.com/carbon-os/diskimg"
+    "github.com/carbon-os/diskimg/mkfs/fat32"
+    "github.com/carbon-os/diskimg/mkfs/ntfs"
+)
+
+func main() {
+    f, err := os.Create("windows.img")
     if err != nil {
         log.Fatal(err)
     }
@@ -311,62 +361,27 @@ func main() {
         log.Fatal(err)
     }
 
-    // 2. Initialise the GPT and declare partitions.
     img, err := diskimg.NewBuilder(f)
     if err != nil {
         log.Fatal(err)
     }
-    efi  := img.AddPartition(diskimg.GUID_EFISystem,  512<<20) // 512 MB EFI
-    data := img.AddPartition(diskimg.GUID_BasicData,  0)       // rest for Windows files
+    efi  := img.AddPartition(diskimg.GUID_EFISystem,  512<<20)
+    data := img.AddPartition(diskimg.GUID_BasicData,  0)
     if err := img.Commit(); err != nil {
         log.Fatal(err)
     }
 
-    // 3. Format both partitions in userspace — no loop device, no root.
     rawEFI, _ := img.OpenRaw(efi.Index)
-    if err := mkfs.FAT32(rawEFI, efi.SizeBytes, mkfs.Options{Label: "EFI"}); err != nil {
+    if err := fat32.Format(rawEFI, efi.SizeBytes, fat32.Options{Label: "EFI"}); err != nil {
         log.Fatal(err)
     }
+
     rawData, _ := img.OpenRaw(data.Index)
-    if err := mkfs.ExFAT(rawData, data.SizeBytes, mkfs.Options{Label: "WINDOWS"}); err != nil {
+    if err := ntfs.Format(rawData, data.SizeBytes, ntfs.Options{Label: "WINDOWS"}); err != nil {
         log.Fatal(err)
     }
 
-    // 4. Mount the freshly formatted volumes and write files.
-    volEFI, err := img.Mount(efi.Index)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer volEFI.Unmount()
-
-    volData, err := img.Mount(data.Index)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer volData.Unmount()
-
-    // 5. Populate the EFI partition.
-    volEFI.MkdirAll("/efi/boot", 0755)
-
-    // 6. Populate the data partition from an ISO image.
-    iso, _ := diskimg.Attach("Win11.iso")
-    isoVol, _ := iso.Mount(1)
-    defer isoVol.Unmount()
-
-    entries, _ := isoVol.ReadDir("/sources")
-    for _, e := range entries {
-        src, _  := isoVol.Open("/sources/" + e.Name())
-        dst, _  := volData.Create("/sources/" + e.Name())
-        io.Copy(dst, src)
-        dst.Close()
-        src.Close()
-    }
-
-    // 7. Inject the answer file.
-    volData.WriteFile("/autounattend.xml", []byte("<unattend>...</unattend>"), 0644)
-
-    // 8. Flush everything; the original file is updated in place.
-    img.Detach("")
+    img.Detach("windows.img")
 }
 ```
 
@@ -389,72 +404,53 @@ diskimg <image.img> --fs <command> <path> [--partition N] [--subvol NAME]
 
 ### `--info`
 
-Print the partition table and full region layout of the image.
+Print the partition table and region layout of the image.
 
 ```
 $ diskimg fedora.img --info
 
 === Partitions ===
-Partition 1: Start: 0000001048576, Size: 629145600  bytes | GUID: C12A7328-...
+Partition 1: Start: 0000001048576, Size:  629145600 bytes | GUID: C12A7328-...
 Partition 2: Start: 0000630194176, Size: 1073741824 bytes | GUID: 0FC63DAF-...
-  └─ Filesystem: btrfs
-  └─ Subvolumes: root, home
-...
+  └─ Filesystem: ext4
+  └─ UUID:       5ae73877-4510-419e-b15a-44ac2a2df7c6
 
 === Disk Layout (Regions) ===
-[0000000000 - 0000017408] Size: 17408      | Boot (MBR/GPT Header)
-[0000017408 - 0001048576] Size: 1031168    | Gap (Unallocated)
-[0001048576 - 0630194176] Size: 629145600  | Partition (1)
+[0000000000 - 0000017408] Size:       17408 | Boot (MBR/GPT Header)
+[0000017408 - 0001048576] Size:     1031168 | Gap (Unallocated)
+[0001048576 - 0630194176] Size:   629145600 | Partition (1)
+[0630194176 - 1703936000] Size:  1073741824 | Partition (2)
 ...
 ```
 
 ### `--fs` subcommands
 
-| Command | Description |
-|---------|-------------|
-| `ls <path>` | List directory contents |
-| `cat <path>` | Print file contents to stdout |
-| `mkdir <path>` | Create directory (and all parents) |
-| `rm <path>` | Remove file or directory (recursive) |
-| `put <host_src> <img_dest>` | Copy a host file into the image |
-| `subvols <any>` | List Btrfs subvolumes on the partition |
+| Command               | Description                                   |
+|-----------------------|-----------------------------------------------|
+| `ls <path>`           | List directory contents                       |
+| `cat <path>`          | Print file contents to stdout                 |
+| `mkdir <path>`        | Create directory (and all parents)            |
+| `rm <path>`           | Remove file or directory (recursive)          |
+| `put <src> <dst>`     | Copy a host file into the image               |
+| `subvols <any>`       | List Btrfs subvolumes on the partition        |
 
-**Flags**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--partition N` | `1` | 1-based partition number to operate on |
-| `--subvol NAME` | *(none)* | Btrfs subvolume to mount (e.g. `root`, `home`) |
+| Flag              | Default | Description                                              |
+|-------------------|---------|----------------------------------------------------------|
+| `--partition N`   | `1`     | 1-based partition number to operate on                   |
+| `--subvol NAME`   |         | Btrfs subvolume to mount (e.g. `root`, `home`)           |
 
 ### Examples
 
 ```bash
-# Inspect an image
-diskimg ubuntu.img --info
-
-# List the root of partition 1
-diskimg ubuntu.img --fs ls /
-
-# List a directory on a specific partition
-diskimg fedora.img --fs ls / --partition 4
-
-# List a directory inside a Btrfs subvolume
-diskimg fedora.img --fs ls /var --partition 4 --subvol root
-
-# Print a file
-diskimg fedora.img --fs cat /etc/os-release --partition 4 --subvol root
-
-# List available Btrfs subvolumes
-diskimg fedora.img --fs subvols . --partition 4
-
-# Copy a host file into the image
-diskimg ubuntu.img --fs put ./myfile /etc/myfile --partition 1
-
-# Create a directory
-diskimg ubuntu.img --fs mkdir /etc/myapp --partition 1
-
-# Remove a file or directory
-diskimg ubuntu.img --fs rm /etc/myapp --partition 1
+diskimg ubuntu.img  --info
+diskimg ubuntu.img  --fs ls /
+diskimg fedora.img  --fs ls / --partition 2
+diskimg fedora.img  --fs ls /var --partition 2 --subvol root
+diskimg fedora.img  --fs cat /etc/os-release --partition 2 --subvol root
+diskimg fedora.img  --fs subvols . --partition 2
+diskimg ubuntu.img  --fs put ./myfile /etc/myfile --partition 1
+diskimg ubuntu.img  --fs mkdir /etc/myapp --partition 1
+diskimg ubuntu.img  --fs rm /etc/myapp --partition 1
 ```
 
 ---
@@ -463,47 +459,75 @@ diskimg ubuntu.img --fs rm /etc/myapp --partition 1
 
 ```
 diskimg/
-├── attach.go        # Attach() — open image, parse partition table
-├── detach.go        # Detach() — flush and close, optional copy-out
-├── mount.go         # Mount() — detect filesystem, return Volume
-├── builder.go       # NewBuilder(), AddPartition(), Commit(), OpenRaw(), Mount()
-├── region.go        # buildRegions() — boot / partition / gap / backup map
+├── attach.go           — Attach(): open image, parse partition table
+├── detach.go           — Detach(): flush and close, optional copy-out
+├── mount.go            — Mount(): detect filesystem, return Volume
+├── builder.go          — NewBuilder(), AddPartition(), Commit(), OpenRaw()
+├── region.go           — buildRegions(): boot / partition / gap / backup map
+│
+├── fs/
+│   ├── volume.go       — Volume interface, File, VolumeInfo
+│   └── fstype/
+│       └── detect.go   — magic-byte filesystem detection
 │
 ├── partition/
-│   ├── partition.go # Partition struct
-│   ├── gpt/gpt.go   # GPT parser
-│   └── mbr/mbr.go   # MBR parser
+│   ├── partition.go    — Partition struct
+│   ├── gpt/gpt.go      — GPT parser
+│   └── mbr/mbr.go      — MBR parser
 │
-├── mkfs/
-│   ├── mkfs.go      # Options, shared binary helpers
-│   ├── fat32.go     # FAT32() — VBR, FSInfo, FAT tables, root directory
-│   └── exfat.go     # ExFAT() — boot region, FAT, bitmap, upcase table, root directory
-│
-└── fs/
-    ├── volume.go    # Volume interface, File, VolumeInfo
-    └── fstype/
-        └── detect.go # Magic-byte filesystem detection
+└── mkfs/
+    ├── ext4/
+    │   ├── ext4.go         — Format() entry point, Options
+    │   ├── layout.go       — geometry pre-computation, hasSuperBackup
+    │   ├── write.go        — single sequential write pass
+    │   ├── superblock.go   — 1024-byte superblock encoding, feature flags
+    │   ├── gdt.go          — 64-byte group descriptor encoding, checksums
+    │   ├── bitmaps.go      — block and inode bitmap construction
+    │   ├── inodes.go       — inode table, extent tree encoding
+    │   ├── dirs.go         — root and lost+found directory entries
+    │   ├── journal.go      — JBD2 journal superblock
+    │   └── helpers.go      — crc32c helper
+    │
+    ├── fat32/
+    │   ├── fat32.go        — Format() entry point, Options
+    │   ├── bpb.go          — VBR and FSInfo sector construction
+    │   ├── fat.go          — FAT table writing, size calculation
+    │   ├── dir.go          — root directory cluster, PadLabel
+    │   └── helpers.go      — binary helpers, sectorsPerCluster
+    │
+    ├── exfat/
+    │   ├── exfat.go        — Format() entry point, Options, fsLayout
+    │   ├── boot.go         — boot region (VBR, extended sectors, checksum)
+    │   ├── fat.go          — FAT chain writing
+    │   ├── upcase.go       — up-case table construction and checksum
+    │   ├── dir.go          — directory entry writers
+    │   └── helpers.go      — binary helpers, spcShift
+    │
+    └── ntfs/
+        ├── ntfs.go         — Format() entry point, Options, fsLayout
+        ├── boot.go         — boot sector and extended BPB definitions
+        ├── mft.go          — MFT record builder, attribute construction
+        ├── records.go      — system file definitions ($MFT, $Boot, $Volume, …)
+        └── helpers.go      — binary helpers, sectorsPerCluster, upcase table
 ```
 
 ### How the pieces fit together
 
-`Attach` and `NewBuilder` are the two entry points. `Attach` parses an
-existing image; `NewBuilder` creates a fresh one. Both ultimately produce
-an `*Image` whose `Mount` method uses `fstype.Detect` to pick the right
-driver and return a `Volume`.
+`Attach` and `NewBuilder` are the two entry points. `Attach` parses an existing
+image; `NewBuilder` creates a fresh one. Both produce an `*Image` whose `Mount`
+method uses `fstype.Detect` to pick the right driver and return a `Volume`.
 
-`mkfs` is completely independent of the rest of the library. Its only
-dependency is the standard library. It receives an `io.ReadWriteSeeker`
-and writes binary structures in one sequential pass. `Builder.OpenRaw`
-supplies that seeker as a mathematically bounded window into the underlying
-`*os.File`, so `mkfs` writes bytes directly to the correct offset in the
-image without any OS involvement and without holding the partition data in
-RAM.
+The `mkfs` subpackages are entirely independent of the rest of the library —
+their only dependency is the standard library (plus `github.com/google/uuid` in
+`mkfs/ext4` for UUID generation). Each formatter receives an `io.ReadWriteSeeker`
+and writes binary structures in one sequential pass. `Builder.OpenRaw` supplies
+that seeker as a bounded window into the underlying `*os.File`, so the formatter
+writes bytes directly to the correct offset in the image without any OS
+involvement and without holding partition data in RAM.
 
-The three layers therefore have clean separation: `diskimg` owns GPT
-geometry, `mkfs` owns filesystem structure, and the caller owns
-orchestration. Each layer can be tested, replaced, or extended without
-touching the others.
+The three layers have clean separation: `diskimg` owns GPT geometry, `mkfs` owns
+filesystem structure, and the caller owns orchestration. Each layer can be
+tested, replaced, or extended without touching the others.
 
 ---
 
