@@ -2,7 +2,6 @@ package ext4
 
 import (
 	"encoding/binary"
-	"hash/crc32"
 )
 
 // buildGDT serialises all group descriptors into a byte slice.

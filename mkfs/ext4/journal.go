@@ -2,6 +2,7 @@ package ext4
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"io"
 )
 

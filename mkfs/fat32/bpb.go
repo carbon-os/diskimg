@@ -12,20 +12,20 @@ func buildVBR(ss int, totalSectors, fatSize uint32, spc uint8, opts Options) []b
 
 	vbr[0], vbr[1], vbr[2] = 0xEB, 0x58, 0x90 // jump boot
 	copy(vbr[3:11], "MSDOS5.0")
-	putU16(vbr[11:], uint16(ss))  // bytes per sector
-	vbr[13] = spc                 // sectors per cluster
-	putU16(vbr[14:], reservedSec) // reserved sectors
-	vbr[16] = numFATs
-	vbr[21] = 0xF8            // media: fixed disk
-	putU16(vbr[24:], 63)      // sectors per track
-	putU16(vbr[26:], 255)     // number of heads
+	putU16(vbr[11:], uint16(ss))          // bytes per sector
+	vbr[13] = spc                         // sectors per cluster
+	putU16(vbr[14:], uint16(reservedSec)) // reserved sectors
+	vbr[16] = byte(numFATs)               // number of FATs
+	vbr[21] = 0xF8                        // media: fixed disk
+	putU16(vbr[24:], 63)                  // sectors per track
+	putU16(vbr[26:], 255)                 // number of heads
 	putU32(vbr[32:], totalSectors)
 	putU32(vbr[36:], fatSize)
-	putU32(vbr[44:], 2)          // root cluster
-	putU16(vbr[48:], 1)          // FSInfo sector
-	putU16(vbr[50:], 6)          // backup boot sector
-	vbr[64] = 0x80               // drive number
-	vbr[66] = 0x29               // extended boot signature
+	putU32(vbr[44:], 2)                   // root cluster
+	putU16(vbr[48:], 1)                   // FSInfo sector
+	putU16(vbr[50:], 6)                   // backup boot sector
+	vbr[64] = 0x80                        // drive number
+	vbr[66] = 0x29                        // extended boot signature
 	putU32(vbr[67:], volumeID)
 	copy(vbr[71:82], PadLabel(opts.Label))
 	copy(vbr[82:90], "FAT32   ")

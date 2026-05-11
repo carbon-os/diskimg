@@ -8,8 +8,8 @@ const (
 	blockSize      = 4096
 	inodeSize      = 256
 	blocksPerGroup = 32768 // 8 * blockSize bits in one bitmap block
-	gdtEntrySize   = 64   // 64-bit group descriptor
-	flexGroupLog   = 4    // s_log_groups_per_flex; flex size = 2^4 = 16
+	gdtEntrySize   = 64    // 64-bit group descriptor
+	flexGroupLog   = 4     // s_log_groups_per_flex; flex size = 2^4 = 16
 	flexGroupSize  = 1 << flexGroupLog
 
 	// Reserved inode numbers (ext4 standard)
@@ -66,12 +66,9 @@ func computeLayout(sizeBytes int64, opts *Options) (*fsLayout, error) {
 	numGroups := uint32((totalBlocks + blocksPerGroup - 1) / blocksPerGroup)
 
 	// Inode count
-	inodesPerGrp := uint32(int64(opts.InodeRatio) > 0 &&
-		sizeBytes/opts.InodeRatio > 0 &&
-		(sizeBytes/opts.InodeRatio)/int64(numGroups) > 0)
-	// recompute properly:
 	rawTotalInodes := sizeBytes / opts.InodeRatio
-	inodesPerGrp = uint32((rawTotalInodes + int64(numGroups) - 1) / int64(numGroups))
+	inodesPerGrp := uint32((rawTotalInodes + int64(numGroups) - 1) / int64(numGroups))
+	
 	// Round up to a multiple of (blockSize/inodeSize) so inode table is block-aligned.
 	alignInodes := uint32(blockSize / inodeSize) // 16
 	inodesPerGrp = ((inodesPerGrp + alignInodes - 1) / alignInodes) * alignInodes
@@ -136,9 +133,9 @@ func computeLayout(sizeBytes int64, opts *Options) (*fsLayout, error) {
 
 		cur := first
 		if gl.hasSB {
-			cur++                       // SB block (or padding+SB in group 0)
-			cur += gdtBlocks            // GDT
-			cur += uint64(reservedGDT)  // reserved GDT expansion space
+			cur++                      // SB block (or padding+SB in group 0)
+			cur += gdtBlocks           // GDT
+			cur += uint64(reservedGDT) // reserved GDT expansion space
 		}
 		gl.blockBitmap = cur; cur++
 		gl.inodeBitmap = cur; cur++
@@ -162,6 +159,17 @@ func computeLayout(sizeBytes int64, opts *Options) (*fsLayout, error) {
 	if jBlocks < 1024 {
 		jBlocks = 1024
 	}
+
+	// Clamp the journal size to fit within Group 0's free blocks without spilling.
+	// We subtract 2 to leave space for the root dir and lost+found.
+	var maxJBlocks uint32
+	if fs.groups[0].freeBlocks > 2 {
+		maxJBlocks = fs.groups[0].freeBlocks - 2
+	}
+	if jBlocks > maxJBlocks {
+		jBlocks = maxJBlocks
+	}
+
 	fs.journalSize = jBlocks
 	fs.journalBlock = fs.groups[0].dataStart
 	fs.groups[0].dataStart += uint64(jBlocks)

@@ -15,7 +15,7 @@ func fatSize(totalSectors uint32, spc uint8) uint32 {
 // writeFATs writes both FAT copies sequentially to w.
 func writeFATs(w io.Writer, ss int, size uint32) error {
 	sec := make([]byte, ss)
-	for fat := 0; fat < numFATs; fat++ {
+	for fat := uint32(0); fat < numFATs; fat++ {
 		putU32(sec[0:], 0x0FFFFFF8) // media descriptor word
 		putU32(sec[4:], 0x0FFFFFFF) // end-of-chain
 		putU32(sec[8:], 0x0FFFFFFF) // root dir cluster, end-of-chain

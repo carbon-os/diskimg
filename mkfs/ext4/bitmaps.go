@@ -11,6 +11,12 @@ func (fs *fsLayout) buildBlockBitmap(g uint32) []byte {
 	// After dataStart the blocks are free — except in group 0 where journal,
 	// root dir and lost+found have already advanced dataStart past them.
 	used := gl.dataStart - gl.firstBlock
+	
+	// Safety clamp to prevent writing beyond the 4096-byte bitmap slice
+	if used > uint64(blocksPerGroup) {
+		used = uint64(blocksPerGroup)
+	}
+	
 	setBits(bm, 0, used)
 
 	// If the group is the last one and doesn't fill a full blocksPerGroup,

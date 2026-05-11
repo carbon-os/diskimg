@@ -92,3 +92,12 @@ func (img *Image) findPartitionRegion(index int) (*Region, error) {
 	}
 	return nil, fmt.Errorf("partition %d not found", index)
 }
+
+// RawFile returns the underlying disk image file for raw byte access.
+// This is used by formatting tools to write filesystems directly onto partitions.
+func (img *Image) RawFile() (*os.File, error) {
+	if img.f == nil {
+		return nil, fmt.Errorf("image file is not open")
+	}
+	return img.f, nil
+}
