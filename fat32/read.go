@@ -25,18 +25,17 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 
 	process := func(raw []byte, dirClus, byteOff uint32) bool {
 		if raw[0] == 0x00 {
-			return false // end of directory
+			return false
 		}
 		if raw[0] == 0xE5 {
 			lfnParts = nil
 			lfnSeq   = 0
-			return true // deleted
+			return true
 		}
 		attr := raw[11]
 		if attr == attrLFN {
 			seq := int(raw[0] & 0x3F)
 			if raw[0]&0x40 != 0 {
-				// First physical LFN entry (highest sequence, logically last).
 				lfnParts = make([]uint16, seq*13)
 				lfnSeq   = seq
 			}
@@ -74,7 +73,6 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 		if lfnParts != nil {
 			runes := utf16.Decode(lfnParts)
 			name  := string(runes)
-			// Trim at first null or 0xFFFF padding.
 			if idx := strings.IndexFunc(name, func(r rune) bool {
 				return r == 0x0000 || r == 0xFFFF
 			}); idx >= 0 {
@@ -92,11 +90,18 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 
 	// FAT12/16 fixed root directory.
 	if v.b.fatType != fstype.FAT32 && firstCluster == 0 {
-		sec      := int64(v.b.firstRootDir) * int64(v.b.bytesPerSec)
+		secSize  := int(v.b.bytesPerSec)
 		rootSize := int64(v.b.rootEntCnt) * 32
 		buf      := make([]byte, rootSize)
+		sec      := int64(v.b.firstRootDir) * int64(secSize)
 		if _, err := v.sr.ReadAt(buf, sec); err != nil {
 			return nil, err
+		}
+		// Overlay dirty root-dir sectors.
+		for i := uint32(0); i < v.b.rootDirSec; i++ {
+			if data, ok := v.dirty[v.b.firstRootDir+i]; ok {
+				copy(buf[int(i)*secSize:], data)
+			}
 		}
 		for i := int64(0); i < rootSize; i += 32 {
 			if !process(buf[i:i+32], 0, uint32(i)) {
@@ -107,8 +112,7 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 	}
 
 	// FAT32 or subdirectory: walk cluster chain.
-	cur    := firstCluster
-	byteOff := uint32(0)
+	cur := firstCluster
 	for cur >= 2 && !v.isEOC(v.fatEntry(cur)) {
 		clus, err := v.readCluster(cur)
 		if err != nil {
@@ -121,8 +125,6 @@ func (v *Volume) readDirFromCluster(firstCluster uint32) ([]fatDirEntry, error) 
 				break
 			}
 		}
-		byteOff += v.b.clusterSize
-		_ = byteOff
 		if !cont {
 			break
 		}
