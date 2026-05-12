@@ -11,7 +11,7 @@ import (
 const (
 	mftRecordSize    = 1024
 	numSysRecords    = 24
-	attrDefCount     = 256 // Typical standard for basic NTFS implementations
+	attrDefCount     = 256
 	attrDefEntrySize = 160
 )
 
@@ -68,7 +68,7 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 	var serialBuf [8]byte
 	rand.Read(serialBuf[:])
 	serial := binary.LittleEndian.Uint64(serialBuf[:])
-	
+
 	boot := buildBootSector(&l, serial)
 	if _, err := rw.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -77,7 +77,7 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// 2. Write Backup Boot Sector (Last Sector)
+	// 2. Write Backup Boot Sector (last sector)
 	if _, err := rw.Seek((l.totalSectors-1)*int64(ss), io.SeekStart); err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// 3. Write MFT Records
+	// 3. Write MFT records
 	mftBytes := buildMFT(&l, time.Now(), opts.Label)
 	if _, err := rw.Seek(l.mftLCN*l.clusterSize, io.SeekStart); err != nil {
 		return err
@@ -94,7 +94,7 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// 4. Write MFTMirr (Mirror of first 4 records)
+	// 4. Write MFTMirr (mirror of first 4 records)
 	if _, err := rw.Seek(l.mftMirrLCN*l.clusterSize, io.SeekStart); err != nil {
 		return err
 	}
@@ -111,10 +111,40 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// Note: LogFile, AttrDef, Bitmap, and other structures require zeroing out 
-	// or specific population depending on how deep your mkfs implementation goes.
+	// 6. Write $Bitmap — marks all system clusters as in-use so the driver
+	//    never allocates over the boot sector, MFT, or other metadata.
+	bitmap := buildBitmap(&l)
+	if _, err := rw.Seek(l.bitmapLCN*l.clusterSize, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := rw.Write(bitmap); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+// buildBitmap returns the on-disk $Bitmap data with all system-reserved
+// clusters marked as in-use (bit = 1). The returned slice is padded to a
+// whole number of clusters so it can be written directly at bitmapLCN.
+func buildBitmap(l *fsLayout) []byte {
+	buf := make([]byte, l.bitmapClusters*l.clusterSize)
+
+	markRange := func(start, count int64) {
+		for i := start; i < start+count; i++ {
+			buf[i/8] |= 1 << (uint(i) % 8)
+		}
+	}
+
+	markRange(0,             l.bootClusters)    // LCN 0:          boot sector
+	markRange(l.mftLCN,     l.mftClusters)      // $MFT
+	markRange(l.mftMirrLCN, l.mftMirrClusters)  // $MFTMirr
+	markRange(l.logFileLCN, l.logFileClusters)   // $LogFile
+	markRange(l.attrDefLCN, l.attrDefClusters)   // $AttrDef
+	markRange(l.upcaseLCN,  l.upcaseClusters)    // $UpCase
+	markRange(l.bitmapLCN,  l.bitmapClusters)    // $Bitmap itself
+
+	return buf
 }
 
 // computeLayout calculates the placements (LCNs) and sizes of all system files.
@@ -131,10 +161,8 @@ func computeLayout(sizeBytes int64, ss int, spc int) fsLayout {
 		totalClusters: totalClusters,
 	}
 
-	// LCN allocations (simplistic sequential allocation for mkfs purposes)
-	l.bootClusters = roundUpI(8192, clusterSize) / clusterSize // Usually 16 sectors at 512b
-	
-	// Start allocating LCNs sequentially after the boot clusters
+	l.bootClusters = roundUpI(8192, clusterSize) / clusterSize
+
 	cursor := l.bootClusters
 
 	// $MFT
@@ -142,11 +170,11 @@ func computeLayout(sizeBytes int64, ss int, spc int) fsLayout {
 	l.mftClusters = roundUpI(int64(numSysRecords*mftRecordSize), clusterSize) / clusterSize
 	cursor += l.mftClusters
 
-	// $MFTMirr (Ideally placed in the middle of the disk, but placing sequentially for simplicity)
+	// $MFTMirr — placed at the middle of the disk
 	l.mftMirrLCN = totalClusters / 2
 	l.mftMirrClusters = roundUpI(4*mftRecordSize, clusterSize) / clusterSize
 
-	// $LogFile (Standard is ~2MB for small drives, ~64MB for large)
+	// $LogFile
 	l.logFileLCN = cursor
 	l.logFileBytes = 2 * 1024 * 1024
 	l.logFileClusters = roundUpI(l.logFileBytes, clusterSize) / clusterSize
@@ -164,8 +192,10 @@ func computeLayout(sizeBytes int64, ss int, spc int) fsLayout {
 
 	// $Bitmap
 	l.bitmapLCN = cursor
-	l.bitmapBytes = roundUpI(totalClusters, 8) / 8 // 1 bit per cluster
+	l.bitmapBytes = roundUpI(totalClusters, 8) / 8
 	l.bitmapClusters = roundUpI(l.bitmapBytes, clusterSize) / clusterSize
-	
+	// Note: $Bitmap is not added to cursor since it is the last system
+	// structure; the driver allocates user data after bitmapLCN+bitmapClusters.
+
 	return l
 }
