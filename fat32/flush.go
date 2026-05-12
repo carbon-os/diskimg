@@ -3,6 +3,8 @@ package fat32
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/carbon-os/diskimg/fs/fstype"
 )
 
 // Unmount flushes all dirty state to the image and releases in-memory
@@ -11,7 +13,9 @@ func (v *Volume) Unmount() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	err := v.flush()
-	// Prevent a second flush from writing to a potentially-closed writer.
+	// Nil out the writer so any subsequent flush call (e.g. from Detach's
+	// internal unmount loop after we've already flushed) is a guaranteed
+	// no-op rather than a write to a closing or closed file descriptor.
 	v.rw = nil
 	return err
 }
@@ -53,8 +57,8 @@ func (v *Volume) flush() error {
 	// ── FSInfo sector (sector 1) — update free cluster count ─────────────────
 	// Per the FAT32 spec the FSInfo free_count and nxt_free fields should
 	// reflect the current state so that mounting OSes don't need to scan
-	// the entire FAT. We recompute free_count from the in-memory FAT.
-	if v.b.fatType == 3 { // FAT32 only
+	// the entire FAT on mount.
+	if v.b.fatType == fstype.FAT32 {
 		if err := v.flushFSInfo(); err != nil {
 			return fmt.Errorf("fat32: flush FSInfo: %w", err)
 		}
@@ -77,23 +81,18 @@ func (v *Volume) flushFSInfo() error {
 	}
 
 	sec := make([]byte, v.b.bytesPerSec)
-	// Lead signature
-	binary.LittleEndian.PutUint32(sec[0:], 0x41615252)
-	// Structure signature
-	binary.LittleEndian.PutUint32(sec[484:], 0x61417272)
-	// Free count
-	binary.LittleEndian.PutUint32(sec[488:], free)
-	// Next free cluster hint
-	binary.LittleEndian.PutUint32(sec[492:], nxtFree)
-	// Trail signature
-	binary.LittleEndian.PutUint32(sec[508:], 0xAA550000)
+	binary.LittleEndian.PutUint32(sec[0:],   0x41615252) // lead signature
+	binary.LittleEndian.PutUint32(sec[484:], 0x61417272) // structure signature
+	binary.LittleEndian.PutUint32(sec[488:], free)        // free cluster count
+	binary.LittleEndian.PutUint32(sec[492:], nxtFree)     // next free cluster hint
+	binary.LittleEndian.PutUint32(sec[508:], 0xAA550000)  // trail signature
 
-	// FSInfo is at sector 1 of the reserved region (BPB_FSInfo = 1).
-	off := v.start + int64(v.b.bytesPerSec) // sector 1
+	// Primary FSInfo at sector 1.
+	off := v.start + int64(v.b.bytesPerSec)
 	if _, err := v.rw.WriteAt(sec, off); err != nil {
 		return err
 	}
-	// Backup copy at sector 7 (= BPB_BkBootSec + 1, mirrors the primary).
+	// Backup copy at sector 7 (mirrors the primary per spec).
 	off = v.start + int64(7)*int64(v.b.bytesPerSec)
 	_, err := v.rw.WriteAt(sec, off)
 	return err
