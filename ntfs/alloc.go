@@ -11,7 +11,13 @@ import (
 
 // ── cluster bitmap ────────────────────────────────────────────────────────────
 
-// allocCluster finds the first free cluster, marks it used, and returns its LCN.
+// allocCluster finds the first free cluster at LCN ≥ 1, marks it used, and
+// returns its LCN.
+//
+// LCN 0 is permanently skipped: it is the partition-relative offset of the
+// NTFS boot sector ($Boot) and must never be handed out for file data.  A
+// correct mkfs will already have that bit set in $Bitmap, but we defend here
+// as well so that a mkfs bug cannot silently corrupt the boot sector.
 func (v *ntfsVolume) allocCluster() (int64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -22,6 +28,14 @@ func (v *ntfsVolume) allocCluster() (int64, error) {
 		for bit := 0; bit < 8; bit++ {
 			if b&(1<<uint(bit)) == 0 {
 				lcn := int64(i*8 + bit)
+				if lcn == 0 {
+					// LCN 0 is the boot sector; never allocate it.
+					// If mkfs left this bit clear that is a mkfs bug;
+					// mark it used now so we never revisit it.
+					v.bitmap[i] |= 1 << uint(bit)
+					v.dirty = true
+					continue
+				}
 				v.bitmap[i] |= 1 << uint(bit)
 				v.dirty = true
 				return lcn, nil
@@ -57,6 +71,9 @@ func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 
 // freeCluster marks a single cluster as free in the bitmap.
 func (v *ntfsVolume) freeCluster(lcn int64) {
+	if lcn == 0 {
+		return // never free the boot sector cluster
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	byteIdx := lcn / 8
