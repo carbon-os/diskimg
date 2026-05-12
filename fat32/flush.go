@@ -14,7 +14,7 @@ func (v *Volume) Unmount() error {
 // back through v.rw (the full-image WriterAt) using v.start as the
 // partition base offset. It is safe to call more than once.
 func (v *Volume) flush() error {
-	if v.rw == nil || len(v.dirty) == 0 && v.fat1 == nil {
+	if v.rw == nil || (len(v.dirty) == 0 && len(v.fat1) == 0) {
 		return nil
 	}
 
