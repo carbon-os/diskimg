@@ -29,12 +29,14 @@ var GUID_LinuxData = mustParseGPTGUID("0FC63DAF-8483-4772-8E79-3D69D8477DE4")
 
 // BuilderPartition describes a single partition queued on a Builder.
 // StartByte and SizeBytes are set by Builder.Commit.
+// UniqueGUID is set by Builder.Commit and holds the partition's unique GPT GUID.
 type BuilderPartition struct {
-	Index     int
-	TypeGUID  [16]byte
-	Name      string
-	StartByte int64 // set by Commit
-	SizeBytes int64 // set by Commit; pass 0 to fill remaining space
+	Index      int
+	TypeGUID   [16]byte
+	UniqueGUID [16]byte // set by Commit
+	Name       string
+	StartByte  int64 // set by Commit
+	SizeBytes  int64 // set by Commit; pass 0 to fill remaining space
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ type Builder struct {
 	diskSize   int64
 	partitions []*BuilderPartition
 	committed  *Image // populated by Commit
+	diskGUID   [16]byte // set by Commit
 }
 
 // NewBuilder wraps f for GPT construction.
@@ -89,9 +92,13 @@ func (b *Builder) AddPartition(typeGUID [16]byte, sizeBytes int64) *BuilderParti
 	return p
 }
 
+// DiskGUID returns the disk GUID written into the GPT header.
+// Only valid after Commit has been called.
+func (b *Builder) DiskGUID() [16]byte { return b.diskGUID }
+
 // Commit writes the protective MBR and GPT structures to the file,
-// assigns StartByte/SizeBytes on each BuilderPartition, and prepares
-// the Builder for OpenRaw / Mount calls.
+// assigns StartByte/SizeBytes/UniqueGUID on each BuilderPartition, and
+// prepares the Builder for OpenRaw / Mount calls.
 func (b *Builder) Commit() error {
 	const ss = 512
 
@@ -145,13 +152,14 @@ func (b *Builder) Commit() error {
 		numEntries = 128
 		entrySize  = 128
 	)
-	diskGUID := builderNewGUID()
+	b.diskGUID = builderNewGUID()
+	diskGUID := b.diskGUID
 	entryBuf := make([]byte, numEntries*entrySize)
 	for _, p := range b.partitions {
 		off := (p.Index - 1) * entrySize
 		copy(entryBuf[off:], p.TypeGUID[:])
-		ug := builderNewGUID()
-		copy(entryBuf[off+16:], ug[:])
+		p.UniqueGUID = builderNewGUID()
+		copy(entryBuf[off+16:], p.UniqueGUID[:])
 		startLBA := uint64(p.StartByte / ss)
 		endLBA := startLBA + uint64(p.SizeBytes/ss) - 1
 		binary.LittleEndian.PutUint64(entryBuf[off+32:], startLBA)
