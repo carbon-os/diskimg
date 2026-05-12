@@ -39,7 +39,7 @@ func (v *ntfsVolume) allocCluster() (int64, error) {
 	return 0, fmt.Errorf("no free clusters (volume full)")
 }
 
-// allocClusters allocates n clusters and returns a runlist.
+// allocClusters allocates n clusters and returns a (possibly fragmented) runlist.
 func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 	var runs []run
 	remaining := n
@@ -60,6 +60,62 @@ func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 		remaining--
 	}
 	return runs, nil
+}
+
+// tryAllocContiguous scans v.bitmap for a run of n contiguous free clusters
+// starting at LCN ≥ 1.  On success it marks them used and returns a single-
+// element runlist.  Returns nil, nil when no run of that size exists.
+//
+// Caller must hold v.mu.
+func (v *ntfsVolume) tryAllocContiguous(n int64) ([]run, error) {
+	needed := int(n)
+	startLCN := -1
+	runLen := 0
+
+	for i := 0; i < len(v.bitmap); i++ {
+		for bit := 0; bit < 8; bit++ {
+			lcn := i*8 + bit
+			if lcn == 0 {
+				startLCN = -1
+				runLen = 0
+				continue
+			}
+			if v.bitmap[i]&(1<<uint(bit)) == 0 {
+				if runLen == 0 {
+					startLCN = lcn
+				}
+				runLen++
+				if runLen >= needed {
+					for j := 0; j < needed; j++ {
+						l := int64(startLCN + j)
+						v.bitmap[l/8] |= 1 << uint(l%8)
+					}
+					v.dirty = true
+					return []run{{lcn: int64(startLCN), length: n}}, nil
+				}
+			} else {
+				startLCN = -1
+				runLen = 0
+			}
+		}
+	}
+	return nil, nil
+}
+
+// allocContiguousClusters allocates n clusters, strongly preferring a single
+// contiguous run so that NTFS runlists (and therefore MFT records) stay small.
+// Falls back to the fragmented allocClusters when no contiguous range exists.
+func (v *ntfsVolume) allocContiguousClusters(n int64) ([]run, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	v.mu.Lock()
+	runs, err := v.tryAllocContiguous(n)
+	v.mu.Unlock()
+	if err != nil || runs != nil {
+		return runs, err
+	}
+	return v.allocClusters(n)
 }
 
 // freeCluster marks a single cluster as free.
@@ -92,7 +148,7 @@ func (v *ntfsVolume) freeRuns(runs []run) {
 // allocAndWrite allocates clusters for data, writes the data, and returns the runlist.
 func (v *ntfsVolume) allocAndWrite(data []byte) ([]run, error) {
 	numClusters := (int64(len(data)) + v.clusterSize - 1) / v.clusterSize
-	runs, err := v.allocClusters(numClusters)
+	runs, err := v.allocContiguousClusters(numClusters)
 	if err != nil {
 		return nil, err
 	}
@@ -162,14 +218,15 @@ func freeMFTSlot(bitmap []byte, n uint64) {
 // after the USA, aligned to 8 bytes.
 //
 // INDX layout:
-//   0x00  4  "INDX"
-//   0x04  2  USA offset = 0x28
-//   0x06  2  USA count  = blockSize/512 + 1
-//   0x08  8  LSN
-//   0x10  8  VCN of this block
-//   0x18 16  INDEX_HEADER (entries_offset, index_length, alloc_size, flags)
-//   0x28  +  USA (usaCount × 2 bytes)
-//   …     +  index entries start here (aligned to 8)
+//
+//	0x00  4  "INDX"
+//	0x04  2  USA offset = 0x28
+//	0x06  2  USA count  = blockSize/512 + 1
+//	0x08  8  LSN
+//	0x10  8  VCN of this block
+//	0x18 16  INDEX_HEADER (entries_offset, index_length, alloc_size, flags)
+//	0x28  +  USA (usaCount × 2 bytes)
+//	…     +  index entries start here (aligned to 8)
 func indxEntriesStart(blockSize int64) int {
 	usaCount := int(blockSize/512) + 1
 	usaEnd := 0x28 + usaCount*2
@@ -190,8 +247,8 @@ func buildINDXBlock(vcn int64, rawEntries []byte, blockSize int64) []byte {
 
 	usaCount := int(blockSize/512) + 1
 	entriesStart := indxEntriesStart(blockSize)
-	entriesOff := entriesStart - 0x18    // relative to INDEX_HEADER at 0x18
-	allocSize := int(blockSize) - 0x18   // relative to INDEX_HEADER
+	entriesOff := entriesStart - 0x18  // relative to INDEX_HEADER at 0x18
+	allocSize := int(blockSize) - 0x18 // relative to INDEX_HEADER
 
 	// INDX record header
 	copy(buf[0:], "INDX")
@@ -494,8 +551,8 @@ func (v *ntfsVolume) spillToIndexAlloc(dirRec []byte, dirMFTNum uint64, entries 
 	// Final (possibly partial) block — always create at least one block.
 	blocks = append(blocks, blockData{raw: flattenEntries(cur)})
 
-	// Allocate one cluster per INDX block (idxBlockSize == clusterSize here).
-	runs, err := v.allocClusters(int64(len(blocks)))
+	// Prefer a single contiguous run so the runlist stays as small as possible.
+	runs, err := v.allocContiguousClusters(int64(len(blocks)))
 	if err != nil {
 		return err
 	}
@@ -543,9 +600,100 @@ func (v *ntfsVolume) spillToIndexAlloc(dirRec []byte, dirMFTNum uint64, entries 
 	return v.putRecord(dirMFTNum, dirRec)
 }
 
+// repackIndexAlloc consolidates a fragmented $INDEX_ALLOCATION into a single
+// contiguous run. It reads all numBlocks existing INDX blocks into memory,
+// frees the old clusters, allocates a fresh contiguous range for
+// numBlocks + 1 clusters, rewrites all existing blocks at their new
+// positions, and writes a new block containing newEntry.
+//
+// This is called from appendEntryToIndexAlloc when the directory MFT record
+// would overflow recSize due to a long fragmented runlist.  By freeing old
+// clusters before the new allocation, we maximise the chance of finding a
+// contiguous range that covers everything in one run.
+func (v *ntfsVolume) repackIndexAlloc(oldRuns []run, numBlocks int64, newEntry []byte, blockSize int64) ([]run, error) {
+	// 1. Read all existing INDX blocks before touching the bitmap.
+	saved := make([][]byte, numBlocks)
+	for vcn := int64(0); vcn < numBlocks; vcn++ {
+		lcn := lcnOfVCN(oldRuns, vcn)
+		if lcn < 0 {
+			return nil, fmt.Errorf("repackIndexAlloc: no LCN for existing VCN %d", vcn)
+		}
+		b := make([]byte, blockSize)
+		if _, err := v.partRead(b, lcn*v.clusterSize); err != nil {
+			return nil, fmt.Errorf("repackIndexAlloc: read VCN %d: %w", vcn, err)
+		}
+		saved[vcn] = b
+	}
+
+	// 2. Release old clusters so they become candidates for the new range.
+	v.freeRuns(oldRuns)
+
+	// 3. Allocate a fresh range: all existing blocks + 1 new block.
+	totalBlocks := numBlocks + 1
+	newRuns, err := v.allocContiguousClusters(totalBlocks)
+	if err != nil {
+		// Contiguous allocation failed (very fragmented volume); fall back to
+		// fragmented allocation — runlist will still be shorter than before
+		// because all blocks now originate from a single fresh allocation.
+		newRuns, err = v.allocClusters(totalBlocks)
+		if err != nil {
+			return nil, fmt.Errorf("repackIndexAlloc: alloc %d clusters: %w", totalBlocks, err)
+		}
+	}
+
+	// 4. Rewrite all existing blocks at their new LCNs.
+	for vcn := int64(0); vcn < numBlocks; vcn++ {
+		lcn := lcnOfVCN(newRuns, vcn)
+		if lcn < 0 {
+			return nil, fmt.Errorf("repackIndexAlloc: no new LCN for VCN %d", vcn)
+		}
+		if _, err := v.partWrite(saved[vcn], lcn*v.clusterSize); err != nil {
+			return nil, fmt.Errorf("repackIndexAlloc: rewrite VCN %d: %w", vcn, err)
+		}
+	}
+
+	// 5. Write the new block.
+	newVCN := numBlocks
+	newLCN := lcnOfVCN(newRuns, newVCN)
+	if newLCN < 0 {
+		return nil, fmt.Errorf("repackIndexAlloc: no LCN for new VCN %d", newVCN)
+	}
+	newBlock := buildINDXBlock(newVCN, flattenEntries([][]byte{newEntry}), blockSize)
+	if _, err := v.partWrite(newBlock, newLCN*v.clusterSize); err != nil {
+		return nil, fmt.Errorf("repackIndexAlloc: write new block: %w", err)
+	}
+
+	return newRuns, nil
+}
+
+// rebuildDirRecIndexAlloc replaces the $INDEX_ALLOCATION and $BITMAP attributes
+// on a cloned directory record with fresh values derived from runs and newBitmap.
+// Returns the (possibly grown) record slice; callers must check len vs recSize.
+func rebuildDirRecIndexAlloc(dirRec []byte, runs []run, totalBytes int64, newBitmap []byte, clusterSize int64) []byte {
+	dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "$I30")
+	if findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30") < 0 {
+		dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "")
+	}
+	dirRec = removeAttr(dirRec, attrBITMAP, "$I30")
+	if findAttrOffset(dirRec, attrBITMAP, "$I30") < 0 {
+		dirRec = removeAttr(dirRec, attrBITMAP, "")
+	}
+	dirRec = appendNonResidentNamedAttr(dirRec, attrINDEX_ALLOCATION, "$I30",
+		runs, totalBytes, clusterSize)
+	off := nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
+	dirRec = appendNamedResidentAttrAt(dirRec, off, attrBITMAP, "$I30", newBitmap)
+	return dirRec
+}
+
 // appendEntryToIndexAlloc adds a single entry to the last INDX block in an
 // existing $INDEX_ALLOCATION, growing the allocation by one cluster if the
 // last block is full.
+//
+// When a new block is needed and the resulting directory MFT record would
+// exceed recSize (because a long fragmented runlist pushes the
+// $INDEX_ALLOCATION attribute past the limit), the entire allocation is
+// repacked into a single contiguous run via repackIndexAlloc before the
+// directory record is written.
 func (v *ntfsVolume) appendEntryToIndexAlloc(dirRec []byte, dirMFTNum uint64, entry []byte) error {
 	// Locate $INDEX_ALLOCATION attribute.
 	iaOff := findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30")
@@ -581,7 +729,7 @@ func (v *ntfsVolume) appendEntryToIndexAlloc(dirRec []byte, dirMFTNum uint64, en
 	}
 	applyUSA(block)
 
-	// Try to insert directly into the last block.
+	// ── fast path: entry fits in the current last block ───────────────────
 	if string(block[:4]) == "INDX" && addEntryToINDXBlock(block, entry) {
 		stampUSA(block, int(blockSize/512))
 		if _, err := v.partWrite(block, lastLCN*v.clusterSize); err != nil {
@@ -590,25 +738,11 @@ func (v *ntfsVolume) appendEntryToIndexAlloc(dirRec []byte, dirMFTNum uint64, en
 		return nil
 	}
 
-	// Last block is full — allocate a new cluster and write a fresh INDX block.
-	newRuns, err := v.allocClusters(1)
-	if err != nil {
-		return err
-	}
-	newLCN := newRuns[0].lcn
+	// ── slow path: allocate a new INDX block ─────────────────────────────
 	newVCN := numBlocks
-	newBlock := buildINDXBlock(newVCN, flattenEntries([][]byte{entry}), blockSize)
-	if _, err := v.partWrite(newBlock, newLCN*v.clusterSize); err != nil {
-		return fmt.Errorf("appendEntryToIndexAlloc: write new INDX block: %w", err)
-	}
-
-	// Rebuild the directory MFT record with the extended $INDEX_ALLOCATION and
-	// updated $BITMAP.
-	dirRec = cloneRecord(dirRec)
-	mergedRuns := mergeRuns(runs, newRuns)
 	newTotalBytes := totalBytes + blockSize
 
-	// Read the old $BITMAP value (named or unnamed).
+	// Read the old $BITMAP value so we can extend it.
 	var oldBitmap []byte
 	bmOff := findAttrOffset(dirRec, attrBITMAP, "$I30")
 	if bmOff < 0 {
@@ -621,25 +755,48 @@ func (v *ntfsVolume) appendEntryToIndexAlloc(dirRec []byte, dirMFTNum uint64, en
 	}
 	newBitmap := growBitmap(oldBitmap, int(newVCN))
 
-	// Remove old attributes and re-add with updated values.
-	dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "$I30")
-	if findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30") < 0 {
-		dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "")
+	// Prefer contiguous allocation to keep the runlist short.
+	newRuns, err := v.allocContiguousClusters(1)
+	if err != nil {
+		return err
 	}
-	dirRec = removeAttr(dirRec, attrBITMAP, "$I30")
-	if findAttrOffset(dirRec, attrBITMAP, "$I30") < 0 {
-		dirRec = removeAttr(dirRec, attrBITMAP, "")
+	mergedRuns := mergeRuns(runs, newRuns)
+
+	// Build a candidate directory record to check whether it fits in recSize.
+	// This is cheap — we do it before any irreversible disk writes.
+	candidate := rebuildDirRecIndexAlloc(
+		cloneRecord(dirRec), mergedRuns, newTotalBytes, newBitmap, v.clusterSize,
+	)
+
+	if len(candidate) > int(v.recSize) {
+		// The runlist is too fragmented to fit even after contiguous allocation.
+		// Free the just-reserved cluster and consolidate the entire allocation.
+		v.freeRuns(newRuns)
+
+		mergedRuns, err = v.repackIndexAlloc(runs, numBlocks, entry, blockSize)
+		if err != nil {
+			return fmt.Errorf("appendEntryToIndexAlloc: repack: %w", err)
+		}
+
+		// Rebuild the candidate with the compact runlist from repack.
+		// repackIndexAlloc already wrote all INDX blocks to disk.
+		candidate = rebuildDirRecIndexAlloc(
+			cloneRecord(dirRec), mergedRuns, newTotalBytes, newBitmap, v.clusterSize,
+		)
+		if len(candidate) > int(v.recSize) {
+			return fmt.Errorf("appendEntryToIndexAlloc: dir %d record %d bytes > recSize after repack",
+				dirMFTNum, len(candidate))
+		}
+		return v.putRecord(dirMFTNum, candidate)
 	}
 
-	dirRec = appendNonResidentNamedAttr(dirRec, attrINDEX_ALLOCATION, "$I30",
-		mergedRuns, newTotalBytes, v.clusterSize)
-	off := nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
-	dirRec = appendNamedResidentAttrAt(dirRec, off, attrBITMAP, "$I30", newBitmap)
-
-	if len(dirRec) > int(v.recSize) {
-		return fmt.Errorf("appendEntryToIndexAlloc: dir %d record %d bytes > recSize", dirMFTNum, len(dirRec))
+	// Candidate fits — write the new INDX block then commit the record.
+	newLCN := newRuns[0].lcn
+	newBlock := buildINDXBlock(newVCN, flattenEntries([][]byte{entry}), blockSize)
+	if _, err := v.partWrite(newBlock, newLCN*v.clusterSize); err != nil {
+		return fmt.Errorf("appendEntryToIndexAlloc: write new INDX block: %w", err)
 	}
-	return v.putRecord(dirMFTNum, dirRec)
+	return v.putRecord(dirMFTNum, candidate)
 }
 
 // removeDirEntry removes the index entry for name from its parent directory.
