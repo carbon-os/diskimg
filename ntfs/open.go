@@ -1,3 +1,4 @@
+// open.go
 // Package ntfs implements a read/write NTFS 3.1 volume driver that operates
 // directly on partition data without OS involvement.
 //
@@ -221,10 +222,57 @@ func (v *ntfsVolume) partWrite(p []byte, off int64) (int, error) {
 	return v.f.WriteAt(p, v.base+off)
 }
 
-// readRawRecord reads MFT record n from its known location and applies the
+// getMFTRecordOffset maps a logical MFT record number to its physical byte
+// offset on the disk by traversing the $MFT runlist.
+func (v *ntfsVolume) getMFTRecordOffset(n uint64) (int64, error) {
+	if n == 0 {
+		return v.mftOff, nil
+	}
+
+	v.mu.Lock()
+	rec0, ok := v.mftCache[0]
+	v.mu.Unlock()
+
+	if !ok {
+		// Fallback if MFT record 0 isn't loaded yet.
+		return v.mftOff + int64(n)*v.recSize, nil
+	}
+
+	dataAttr := findAttr(rec0, attrDATA, "")
+	if dataAttr == nil || dataAttr[8] == 0 {
+		// If $DATA is resident or missing, assume contiguous early MFT zone.
+		return v.mftOff + int64(n)*v.recSize, nil
+	}
+
+	rlOff := int(binary.LittleEndian.Uint16(dataAttr[0x20:]))
+	runs, err := decodeRunlist(dataAttr[rlOff:])
+	if err != nil {
+		return 0, err
+	}
+
+	targetByte := int64(n) * v.recSize
+	var currentByte int64
+
+	for _, r := range runs {
+		runBytes := r.length * v.clusterSize
+		if targetByte >= currentByte && targetByte < currentByte+runBytes {
+			// Found the cluster run containing our record.
+			return r.lcn*v.clusterSize + (targetByte - currentByte), nil
+		}
+		currentByte += runBytes
+	}
+
+	return 0, fmt.Errorf("MFT record %d is beyond allocated $MFT size", n)
+}
+
+// readRawRecord reads MFT record n from its actual mapped location and applies the
 // Update Sequence Array fixup.
 func (v *ntfsVolume) readRawRecord(n uint64) ([]byte, error) {
-	off := v.mftOff + int64(n)*v.recSize
+	off, err := v.getMFTRecordOffset(n)
+	if err != nil {
+		return nil, err
+	}
+
 	buf := make([]byte, v.recSize)
 	if _, err := v.partRead(buf, off); err != nil {
 		return nil, fmt.Errorf("read record %d: %w", n, err)
@@ -261,12 +309,26 @@ func (v *ntfsVolume) getRecord(n uint64) ([]byte, error) {
 // putRecord writes rec to MFT slot n after re-encoding the USA, and updates
 // the in-memory cache with the non-stamped copy.
 func (v *ntfsVolume) putRecord(n uint64, rec []byte) error {
-	encoded := make([]byte, len(rec))
-	copy(encoded, rec)
+	// FATAL BUG PREVENTION: Never write more than v.recSize bytes!
+	// If a directory's resident index overflows, it must be rejected until
+	// $INDEX_ALLOCATION is properly implemented for writing.
+	if len(rec) > int(v.recSize) {
+		return fmt.Errorf("MFT record %d exceeded allocated size (%d > %d bytes) - directory index too large for resident storage", n, len(rec), v.recSize)
+	}
+
+	encoded := make([]byte, v.recSize)
+	copy(encoded, rec) // If rec is shorter than recSize, the rest will correctly remain zeroed.
 	stampUSA(encoded, int(v.recSize/512))
-	if _, err := v.partWrite(encoded, v.mftOff+int64(n)*v.recSize); err != nil {
+
+	off, err := v.getMFTRecordOffset(n)
+	if err != nil {
+		return err
+	}
+
+	if _, err := v.partWrite(encoded, off); err != nil {
 		return fmt.Errorf("write MFT record %d: %w", n, err)
 	}
+	
 	v.mu.Lock()
 	v.mftCache[n] = rec
 	v.dirty = true
