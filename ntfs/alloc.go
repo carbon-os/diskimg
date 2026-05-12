@@ -12,12 +12,8 @@ import (
 // ── cluster bitmap ────────────────────────────────────────────────────────────
 
 // allocCluster finds the first free cluster at LCN ≥ 1, marks it used, and
-// returns its LCN.
-//
-// LCN 0 is permanently skipped: it is the partition-relative offset of the
-// NTFS boot sector ($Boot) and must never be handed out for file data.  A
-// correct mkfs will already have that bit set in $Bitmap, but we defend here
-// as well so that a mkfs bug cannot silently corrupt the boot sector.
+// returns its LCN.  LCN 0 is the NTFS boot sector and must never be allocated
+// for file data; if mkfs left that bit clear we correct it silently here.
 func (v *ntfsVolume) allocCluster() (int64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -29,9 +25,7 @@ func (v *ntfsVolume) allocCluster() (int64, error) {
 			if b&(1<<uint(bit)) == 0 {
 				lcn := int64(i*8 + bit)
 				if lcn == 0 {
-					// LCN 0 is the boot sector; never allocate it.
-					// If mkfs left this bit clear that is a mkfs bug;
-					// mark it used now so we never revisit it.
+					// Boot sector cluster — mark used and keep scanning.
 					v.bitmap[i] |= 1 << uint(bit)
 					v.dirty = true
 					continue
@@ -45,7 +39,7 @@ func (v *ntfsVolume) allocCluster() (int64, error) {
 	return 0, fmt.Errorf("no free clusters (volume full)")
 }
 
-// allocClusters allocates n contiguous-or-scattered clusters and returns a runlist.
+// allocClusters allocates n clusters and returns a runlist.
 func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 	var runs []run
 	remaining := n
@@ -54,7 +48,6 @@ func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Extend the last run if contiguous, otherwise start a new one.
 		if len(runs) > 0 {
 			last := &runs[len(runs)-1]
 			if last.lcn+last.length == lcn {
@@ -69,10 +62,10 @@ func (v *ntfsVolume) allocClusters(n int64) ([]run, error) {
 	return runs, nil
 }
 
-// freeCluster marks a single cluster as free in the bitmap.
+// freeCluster marks a single cluster as free.
 func (v *ntfsVolume) freeCluster(lcn int64) {
 	if lcn == 0 {
-		return // never free the boot sector cluster
+		return
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -103,7 +96,6 @@ func (v *ntfsVolume) allocAndWrite(data []byte) ([]run, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Write the data cluster by cluster across the runs.
 	var written int64
 	for _, r := range runs {
 		for c := int64(0); c < r.length; c++ {
@@ -128,8 +120,6 @@ func (v *ntfsVolume) allocAndWrite(data []byte) ([]run, error) {
 
 // ── MFT record bitmap ─────────────────────────────────────────────────────────
 
-// allocMFTRecord finds the first free MFT record slot, marks it used, and
-// returns its record number.
 func (v *ntfsVolume) allocMFTRecord() (uint64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -141,7 +131,7 @@ func (v *ntfsVolume) allocMFTRecord() (uint64, error) {
 			if b&(1<<uint(bit)) == 0 {
 				n := uint64(i*8 + bit)
 				if n < 12 {
-					continue // never reuse the 12 system records
+					continue
 				}
 				v.mftBitmap[i] |= 1 << uint(bit)
 				v.dirty = true
@@ -149,15 +139,13 @@ func (v *ntfsVolume) allocMFTRecord() (uint64, error) {
 			}
 		}
 	}
-	// Extend the MFT bitmap by one byte (= 8 new record slots).
-	newByte := byte(0x01) // mark first new slot as used
+	newByte := byte(0x01)
 	n := uint64(len(v.mftBitmap) * 8)
 	v.mftBitmap = append(v.mftBitmap, newByte)
 	v.dirty = true
 	return n, nil
 }
 
-// freeMFTSlot marks MFT record n as free in the bitmap.
 func freeMFTSlot(bitmap []byte, n uint64) {
 	byteIdx := n / 8
 	bitIdx := uint(n % 8)
@@ -166,12 +154,249 @@ func freeMFTSlot(bitmap []byte, n uint64) {
 	}
 }
 
+// ── INDX block helpers ────────────────────────────────────────────────────────
+
+// indxEntriesStart returns the absolute offset within an INDX block where
+// index entries begin.  The USA (Update Sequence Array) occupies the bytes
+// immediately following the 24-byte INDX+INDEX_HEADER preamble; entries start
+// after the USA, aligned to 8 bytes.
+//
+// INDX layout:
+//   0x00  4  "INDX"
+//   0x04  2  USA offset = 0x28
+//   0x06  2  USA count  = blockSize/512 + 1
+//   0x08  8  LSN
+//   0x10  8  VCN of this block
+//   0x18 16  INDEX_HEADER (entries_offset, index_length, alloc_size, flags)
+//   0x28  +  USA (usaCount × 2 bytes)
+//   …     +  index entries start here (aligned to 8)
+func indxEntriesStart(blockSize int64) int {
+	usaCount := int(blockSize/512) + 1
+	usaEnd := 0x28 + usaCount*2
+	return (usaEnd + 7) &^ 7
+}
+
+// indxUsableSpace returns how many bytes are available for index entries in a
+// single INDX block (excluding the 16-byte end-sentinel).
+func indxUsableSpace(blockSize int64) int64 {
+	return blockSize - int64(indxEntriesStart(blockSize)) - 16
+}
+
+// buildINDXBlock constructs a complete, USA-stamped INDX block.
+// rawEntries is the concatenated bytes of all entries to place in the block
+// (must fit within indxUsableSpace).  vcn is the 0-based block index.
+func buildINDXBlock(vcn int64, rawEntries []byte, blockSize int64) []byte {
+	buf := make([]byte, blockSize)
+
+	usaCount := int(blockSize/512) + 1
+	entriesStart := indxEntriesStart(blockSize)
+	entriesOff := entriesStart - 0x18    // relative to INDEX_HEADER at 0x18
+	allocSize := int(blockSize) - 0x18   // relative to INDEX_HEADER
+
+	// INDX record header
+	copy(buf[0:], "INDX")
+	binary.LittleEndian.PutUint16(buf[0x04:], 0x28)
+	binary.LittleEndian.PutUint16(buf[0x06:], uint16(usaCount))
+	// LSN = 0 (already zeroed by make)
+	binary.LittleEndian.PutUint64(buf[0x10:], uint64(vcn))
+
+	// INDEX_HEADER at 0x18
+	binary.LittleEndian.PutUint32(buf[0x18:], uint32(entriesOff))
+	// index_length and alloc_size at 0x1C and 0x20
+	binary.LittleEndian.PutUint32(buf[0x20:], uint32(allocSize))
+	// flags = 0 (leaf node, no sub-tree pointers)
+
+	// USA initial check value
+	binary.LittleEndian.PutUint16(buf[0x28:], 1)
+
+	// Copy entries
+	if len(rawEntries) > 0 {
+		copy(buf[entriesStart:], rawEntries)
+	}
+
+	// End sentinel: entLen=16, keyLen=0, flags=idxFlagLastEntry
+	sentinelOff := entriesStart + len(rawEntries)
+	binary.LittleEndian.PutUint16(buf[sentinelOff+8:], 16)
+	binary.LittleEndian.PutUint32(buf[sentinelOff+12:], uint32(idxFlagLastEntry))
+
+	// index_length = entriesOff + sizeof(all_entries) + sizeof(sentinel)
+	indexLen := entriesOff + len(rawEntries) + 16
+	binary.LittleEndian.PutUint32(buf[0x1C:], uint32(indexLen))
+
+	// Stamp USA (sectors = blockSize/512; stampUSA takes sector count, not usaCount)
+	stampUSA(buf, int(blockSize/512))
+	return buf
+}
+
+// buildEmptyIndexRootVal builds a minimal $INDEX_ROOT value (16-byte root
+// header preserved from src, plus an empty INDEX_HEADER with just the
+// end-sentinel).  Used after spilling all entries to $INDEX_ALLOCATION.
+func buildEmptyIndexRootVal(src []byte) []byte {
+	// src is the original 16-byte INDEX_ROOT_HEADER (attr type, collation,
+	// block size, clusters/block) from the existing $INDEX_ROOT value.
+	ir := make([]byte, 48)
+	if len(src) >= 16 {
+		copy(ir[0:16], src[:16])
+	}
+	// INDEX_HEADER at offset 16:
+	//   entries_offset = 16  (entries immediately follow INDEX_HEADER)
+	//   index_length   = 32  (INDEX_HEADER[16] + sentinel[16])
+	//   alloc_size     = 32
+	//   flags          = 0   (leaf node)
+	binary.LittleEndian.PutUint32(ir[16:], 16)
+	binary.LittleEndian.PutUint32(ir[20:], 32)
+	binary.LittleEndian.PutUint32(ir[24:], 32)
+	// End sentinel at offset 32 (= 16 INDEX_HEADER + 16 entries_offset):
+	binary.LittleEndian.PutUint16(ir[40:], 16)
+	binary.LittleEndian.PutUint32(ir[44:], uint32(idxFlagLastEntry))
+	return ir
+}
+
+// collectRawIndexEntries extracts all non-sentinel entries from an
+// INDEX_HEADER body as a slice of raw byte slices.
+func collectRawIndexEntries(hdr []byte) [][]byte {
+	if len(hdr) < 8 {
+		return nil
+	}
+	entriesOff := int(binary.LittleEndian.Uint32(hdr[0:]))
+	indexLen := int(binary.LittleEndian.Uint32(hdr[4:]))
+	if entriesOff > len(hdr) || indexLen > len(hdr) {
+		return nil
+	}
+	data := hdr[entriesOff:indexLen]
+	var out [][]byte
+	off := 0
+	for off+16 <= len(data) {
+		flags := binary.LittleEndian.Uint32(data[off+12:])
+		if flags&idxFlagLastEntry != 0 {
+			break
+		}
+		entLen := int(binary.LittleEndian.Uint16(data[off+8:]))
+		if entLen <= 0 {
+			break
+		}
+		e := make([]byte, entLen)
+		copy(e, data[off:off+entLen])
+		out = append(out, e)
+		off += entLen
+	}
+	return out
+}
+
+// flattenEntries concatenates a slice of raw entry byte slices.
+func flattenEntries(entries [][]byte) []byte {
+	var total int
+	for _, e := range entries {
+		total += len(e)
+	}
+	buf := make([]byte, total)
+	off := 0
+	for _, e := range entries {
+		copy(buf[off:], e)
+		off += len(e)
+	}
+	return buf
+}
+
+// lcnOfVCN returns the LCN for a given virtual cluster number within a runlist.
+func lcnOfVCN(runs []run, vcn int64) int64 {
+	var off int64
+	for _, r := range runs {
+		if vcn >= off && vcn < off+r.length {
+			return r.lcn + (vcn - off)
+		}
+		off += r.length
+	}
+	return -1
+}
+
+// mergeRuns extends existing runs with newRuns, coalescing contiguous runs.
+func mergeRuns(existing, newRuns []run) []run {
+	result := make([]run, len(existing))
+	copy(result, existing)
+	for _, nr := range newRuns {
+		if len(result) > 0 {
+			last := &result[len(result)-1]
+			if last.lcn+last.length == nr.lcn {
+				last.length += nr.length
+				continue
+			}
+		}
+		result = append(result, nr)
+	}
+	return result
+}
+
+// growBitmap returns a bitmap with bit n set, expanding the slice if needed.
+func growBitmap(existing []byte, n int) []byte {
+	needed := n/8 + 1
+	bm := make([]byte, needed)
+	copy(bm, existing)
+	bm[n/8] |= 1 << uint(n%8)
+	return bm
+}
+
+// addEntryToINDXBlock inserts entry into an already-USA-applied INDX block
+// immediately before the end-sentinel.  Returns false if there is not enough
+// space.
+func addEntryToINDXBlock(block []byte, entry []byte) bool {
+	if len(block) < 0x28 || string(block[:4]) != "INDX" {
+		return false
+	}
+	entriesOff := int(binary.LittleEndian.Uint32(block[0x18:]))
+	indexLen := int(binary.LittleEndian.Uint32(block[0x1C:]))
+	allocSize := int(binary.LittleEndian.Uint32(block[0x20:]))
+	if allocSize-indexLen < len(entry) {
+		return false
+	}
+	hdrStart := 0x18
+	dataStart := hdrStart + entriesOff
+	dataLen := indexLen - entriesOff
+	if dataStart+dataLen > len(block) {
+		return false
+	}
+	data := block[dataStart : dataStart+dataLen]
+	// Locate the end-sentinel.
+	sentinelRelOff := -1
+	off := 0
+	for off+16 <= len(data) {
+		flags := binary.LittleEndian.Uint32(data[off+12:])
+		if flags&idxFlagLastEntry != 0 {
+			sentinelRelOff = off
+			break
+		}
+		entLen := int(binary.LittleEndian.Uint16(data[off+8:]))
+		if entLen <= 0 {
+			break
+		}
+		off += entLen
+	}
+	if sentinelRelOff < 0 {
+		return false
+	}
+	sentinelAbsOff := dataStart + sentinelRelOff
+	afterSentinel := sentinelAbsOff + 16
+	if afterSentinel+len(entry) > len(block) {
+		return false
+	}
+	// Shift sentinel forward to make room.
+	copy(block[sentinelAbsOff+len(entry):], block[sentinelAbsOff:afterSentinel])
+	copy(block[sentinelAbsOff:], entry)
+	binary.LittleEndian.PutUint32(block[0x1C:], uint32(indexLen+len(entry)))
+	return true
+}
+
 // ── directory index management ────────────────────────────────────────────────
 
 // addDirEntry inserts a $FILE_NAME index entry into the directory at dirMFTNum.
-// This implementation handles the resident-only (small directory) case directly.
-// Large directories with $INDEX_ALLOCATION are handled by appending to a new
-// index block.
+//
+// Strategy:
+//  1. If $INDEX_ALLOCATION already exists on the directory, append the new
+//     entry directly to the index allocation (never touch $INDEX_ROOT again).
+//  2. Otherwise, try to fit the new entry into the resident $INDEX_ROOT.
+//  3. If inserting into $INDEX_ROOT would push the MFT record past recSize,
+//     spill all existing entries plus the new one into $INDEX_ALLOCATION and
+//     leave $INDEX_ROOT as an empty root node.
 func (v *ntfsVolume) addDirEntry(dirMFTNum uint64, name string, childMFTNum uint64, isDir bool) error {
 	dirRec, err := v.getRecord(dirMFTNum)
 	if err != nil {
@@ -179,6 +404,21 @@ func (v *ntfsVolume) addDirEntry(dirMFTNum uint64, name string, childMFTNum uint
 	}
 	dirRec = cloneRecord(dirRec)
 
+	// Build the new index entry.
+	fa := uint32(faArchive)
+	if isDir {
+		fa = faDirectory
+	}
+	fnKey := buildFileNameAttr(name, dirMFTNum, fa, isDir)
+	entry := buildIndexEntry(childMFTNum, fnKey)
+
+	// ── fast path: $INDEX_ALLOCATION already exists ───────────────────────
+	if findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30") >= 0 ||
+		findAttrOffset(dirRec, attrINDEX_ALLOCATION, "") >= 0 {
+		return v.appendEntryToIndexAlloc(dirRec, dirMFTNum, entry)
+	}
+
+	// ── locate $INDEX_ROOT ────────────────────────────────────────────────
 	idxRootOff := findAttrOffset(dirRec, attrINDEX_ROOT, "$I30")
 	if idxRootOff < 0 {
 		idxRootOff = findAttrOffset(dirRec, attrINDEX_ROOT, "")
@@ -193,33 +433,212 @@ func (v *ntfsVolume) addDirEntry(dirMFTNum uint64, name string, childMFTNum uint
 		return fmt.Errorf("$INDEX_ROOT value out of bounds")
 	}
 
-	// Build index entry for the new file.
-	fa := uint32(faArchive)
-	if isDir {
-		fa = faDirectory
-	}
-	fnKey := buildFileNameAttr(name, dirMFTNum, fa, isDir)
-	entry := buildIndexEntry(childMFTNum, fnKey)
-
-	// Insert before the last-entry sentinel in the resident index.
 	idxHdr := dirRec[valOff+16 : valOff+valLen]
 	newHdr, err := insertIndexEntry(idxHdr, entry)
 	if err != nil {
 		return err
 	}
 
-	// Rebuild the $INDEX_ROOT attribute value.
 	newVal := make([]byte, 16+len(newHdr))
-	copy(newVal, dirRec[valOff:valOff+16]) // copy the first 16 bytes (attr type, collation, …)
+	copy(newVal, dirRec[valOff:valOff+16])
 	copy(newVal[16:], newHdr)
 
-	// Replace the $INDEX_ROOT attribute.
+	// Calculate the MFT record size after the update.  The $INDEX_ROOT will be
+	// re-added as a named "$I30" attribute (nameBytes = 8, valOff = 40).
+	oldAttrLen := int(binary.LittleEndian.Uint32(dirRec[idxRootOff+4:]))
+	newAttrLen := (40 + len(newVal) + 7) &^ 7 // named resident hdr = 40 bytes
+	usedNow := int(binary.LittleEndian.Uint32(dirRec[0x18:]))
+	projectedUsed := usedNow - oldAttrLen + newAttrLen
+
+	if int64(projectedUsed+8) <= v.recSize { // +8 for end-marker
+		// ── fits: update $INDEX_ROOT inline ──────────────────────────────
+		dirRec = removeAttr(dirRec, attrINDEX_ROOT, "$I30")
+		if findAttrOffset(dirRec, attrINDEX_ROOT, "$I30") < 0 {
+			dirRec = removeAttr(dirRec, attrINDEX_ROOT, "")
+		}
+		off := nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
+		dirRec = appendNamedResidentAttrAt(dirRec, off, attrINDEX_ROOT, "$I30", newVal)
+		return v.putRecord(dirMFTNum, dirRec)
+	}
+
+	// ── overflow: spill all entries + new one to $INDEX_ALLOCATION ────────
+	existing := collectRawIndexEntries(idxHdr)
+	allEntries := append(existing, entry)
+	idxRootHdr := make([]byte, 16)
+	copy(idxRootHdr, dirRec[valOff:valOff+16]) // preserve INDEX_ROOT_HEADER
+
+	return v.spillToIndexAlloc(dirRec, dirMFTNum, allEntries, idxRootHdr)
+}
+
+// spillToIndexAlloc moves all entries out of $INDEX_ROOT into one or more
+// INDX blocks in a new $INDEX_ALLOCATION attribute, then sets $INDEX_ROOT to
+// an empty root node and adds $BITMAP.
+func (v *ntfsVolume) spillToIndexAlloc(dirRec []byte, dirMFTNum uint64, entries [][]byte, idxRootHdr []byte) error {
+	blockSize := v.idxBlockSize
+	usable := indxUsableSpace(blockSize)
+
+	// Pack entries into blocks, filling each block before starting the next.
+	type blockData struct{ raw []byte }
+	var blocks []blockData
+	var cur [][]byte
+	var curBytes int
+	for _, e := range entries {
+		if int64(curBytes+len(e)) > usable && len(cur) > 0 {
+			blocks = append(blocks, blockData{raw: flattenEntries(cur)})
+			cur = nil
+			curBytes = 0
+		}
+		cur = append(cur, e)
+		curBytes += len(e)
+	}
+	// Final (possibly partial) block — always create at least one block.
+	blocks = append(blocks, blockData{raw: flattenEntries(cur)})
+
+	// Allocate one cluster per INDX block (idxBlockSize == clusterSize here).
+	runs, err := v.allocClusters(int64(len(blocks)))
+	if err != nil {
+		return err
+	}
+
+	// Write INDX blocks.
+	for vcn, b := range blocks {
+		lcn := lcnOfVCN(runs, int64(vcn))
+		if lcn < 0 {
+			return fmt.Errorf("spillToIndexAlloc: no LCN for VCN %d", vcn)
+		}
+		block := buildINDXBlock(int64(vcn), b.raw, blockSize)
+		if _, err := v.partWrite(block, lcn*v.clusterSize); err != nil {
+			return fmt.Errorf("spillToIndexAlloc: write INDX VCN %d: %w", vcn, err)
+		}
+	}
+
+	// Rebuild the directory MFT record.
+	dirRec = cloneRecord(dirRec)
+
+	// Replace $INDEX_ROOT with an empty root node (entries_offset=16, just sentinel).
 	dirRec = removeAttr(dirRec, attrINDEX_ROOT, "$I30")
 	if findAttrOffset(dirRec, attrINDEX_ROOT, "$I30") < 0 {
 		dirRec = removeAttr(dirRec, attrINDEX_ROOT, "")
 	}
+	emptyRoot := buildEmptyIndexRootVal(idxRootHdr)
 	off := nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
-	dirRec = appendNamedResidentAttrAt(dirRec, off, attrINDEX_ROOT, "$I30", newVal)
+	dirRec = appendNamedResidentAttrAt(dirRec, off, attrINDEX_ROOT, "$I30", emptyRoot)
+
+	// Add $INDEX_ALLOCATION (non-resident, named "$I30").
+	totalBytes := int64(len(blocks)) * blockSize
+	dirRec = appendNonResidentNamedAttr(dirRec, attrINDEX_ALLOCATION, "$I30",
+		runs, totalBytes, v.clusterSize)
+
+	// Add $BITMAP (resident, named "$I30"): one bit per INDX block, all set.
+	bitmapVal := make([]byte, (len(blocks)+7)/8)
+	for i := range blocks {
+		bitmapVal[i/8] |= 1 << uint(i%8)
+	}
+	off = nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
+	dirRec = appendNamedResidentAttrAt(dirRec, off, attrBITMAP, "$I30", bitmapVal)
+
+	if len(dirRec) > int(v.recSize) {
+		return fmt.Errorf("spillToIndexAlloc: dir %d MFT record still too large (%d bytes) after spill", dirMFTNum, len(dirRec))
+	}
+	return v.putRecord(dirMFTNum, dirRec)
+}
+
+// appendEntryToIndexAlloc adds a single entry to the last INDX block in an
+// existing $INDEX_ALLOCATION, growing the allocation by one cluster if the
+// last block is full.
+func (v *ntfsVolume) appendEntryToIndexAlloc(dirRec []byte, dirMFTNum uint64, entry []byte) error {
+	// Locate $INDEX_ALLOCATION attribute.
+	iaOff := findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30")
+	if iaOff < 0 {
+		iaOff = findAttrOffset(dirRec, attrINDEX_ALLOCATION, "")
+	}
+	if iaOff < 0 {
+		return fmt.Errorf("appendEntryToIndexAlloc: directory %d has no $INDEX_ALLOCATION", dirMFTNum)
+	}
+	iaLen := int(binary.LittleEndian.Uint32(dirRec[iaOff+4:]))
+	iaAttr := dirRec[iaOff : iaOff+iaLen]
+
+	rlOff := int(binary.LittleEndian.Uint16(iaAttr[0x20:]))
+	totalBytes := int64(binary.LittleEndian.Uint64(iaAttr[0x30:]))
+
+	runs, err := decodeRunlist(iaAttr[rlOff:])
+	if err != nil {
+		return fmt.Errorf("appendEntryToIndexAlloc: decode runlist: %w", err)
+	}
+
+	blockSize := v.idxBlockSize
+	numBlocks := totalBytes / blockSize
+
+	// Read the last INDX block.
+	lastVCN := numBlocks - 1
+	lastLCN := lcnOfVCN(runs, lastVCN)
+	if lastLCN < 0 {
+		return fmt.Errorf("appendEntryToIndexAlloc: cannot find LCN for VCN %d", lastVCN)
+	}
+	block := make([]byte, blockSize)
+	if _, err := v.partRead(block, lastLCN*v.clusterSize); err != nil {
+		return fmt.Errorf("appendEntryToIndexAlloc: read last INDX block: %w", err)
+	}
+	applyUSA(block)
+
+	// Try to insert directly into the last block.
+	if string(block[:4]) == "INDX" && addEntryToINDXBlock(block, entry) {
+		stampUSA(block, int(blockSize/512))
+		if _, err := v.partWrite(block, lastLCN*v.clusterSize); err != nil {
+			return fmt.Errorf("appendEntryToIndexAlloc: write INDX block: %w", err)
+		}
+		return nil
+	}
+
+	// Last block is full — allocate a new cluster and write a fresh INDX block.
+	newRuns, err := v.allocClusters(1)
+	if err != nil {
+		return err
+	}
+	newLCN := newRuns[0].lcn
+	newVCN := numBlocks
+	newBlock := buildINDXBlock(newVCN, flattenEntries([][]byte{entry}), blockSize)
+	if _, err := v.partWrite(newBlock, newLCN*v.clusterSize); err != nil {
+		return fmt.Errorf("appendEntryToIndexAlloc: write new INDX block: %w", err)
+	}
+
+	// Rebuild the directory MFT record with the extended $INDEX_ALLOCATION and
+	// updated $BITMAP.
+	dirRec = cloneRecord(dirRec)
+	mergedRuns := mergeRuns(runs, newRuns)
+	newTotalBytes := totalBytes + blockSize
+
+	// Read the old $BITMAP value (named or unnamed).
+	var oldBitmap []byte
+	bmOff := findAttrOffset(dirRec, attrBITMAP, "$I30")
+	if bmOff < 0 {
+		bmOff = findAttrOffset(dirRec, attrBITMAP, "")
+	}
+	if bmOff >= 0 {
+		bvLen := int(binary.LittleEndian.Uint32(dirRec[bmOff+0x10:]))
+		bvOff := bmOff + int(binary.LittleEndian.Uint16(dirRec[bmOff+0x14:]))
+		oldBitmap = dirRec[bvOff : bvOff+bvLen]
+	}
+	newBitmap := growBitmap(oldBitmap, int(newVCN))
+
+	// Remove old attributes and re-add with updated values.
+	dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "$I30")
+	if findAttrOffset(dirRec, attrINDEX_ALLOCATION, "$I30") < 0 {
+		dirRec = removeAttr(dirRec, attrINDEX_ALLOCATION, "")
+	}
+	dirRec = removeAttr(dirRec, attrBITMAP, "$I30")
+	if findAttrOffset(dirRec, attrBITMAP, "$I30") < 0 {
+		dirRec = removeAttr(dirRec, attrBITMAP, "")
+	}
+
+	dirRec = appendNonResidentNamedAttr(dirRec, attrINDEX_ALLOCATION, "$I30",
+		mergedRuns, newTotalBytes, v.clusterSize)
+	off := nextAttrOffset(dirRec, int(binary.LittleEndian.Uint16(dirRec[0x14:])))
+	dirRec = appendNamedResidentAttrAt(dirRec, off, attrBITMAP, "$I30", newBitmap)
+
+	if len(dirRec) > int(v.recSize) {
+		return fmt.Errorf("appendEntryToIndexAlloc: dir %d record %d bytes > recSize", dirMFTNum, len(dirRec))
+	}
 	return v.putRecord(dirMFTNum, dirRec)
 }
 
@@ -238,7 +657,7 @@ func (v *ntfsVolume) removeDirEntry(filePath string) error {
 		idxRootOff = findAttrOffset(dirRec, attrINDEX_ROOT, "")
 	}
 	if idxRootOff < 0 {
-		return nil // no index; nothing to remove
+		return nil
 	}
 
 	valOff := idxRootOff + int(binary.LittleEndian.Uint16(dirRec[idxRootOff+0x14:]))
@@ -266,7 +685,7 @@ func (v *ntfsVolume) removeDirEntry(filePath string) error {
 // buildIndexEntry constructs a binary $I30 index entry for a $FILE_NAME key.
 func buildIndexEntry(mftNum uint64, fnKey []byte) []byte {
 	keyLen := len(fnKey)
-	entLen := (16 + keyLen + 7) &^ 7 // 16-byte header + key, aligned to 8
+	entLen := (16 + keyLen + 7) &^ 7
 	entry := make([]byte, entLen)
 	binary.LittleEndian.PutUint64(entry[0:], mftNum|uint64(1)<<48)
 	binary.LittleEndian.PutUint16(entry[8:], uint16(entLen))
@@ -277,7 +696,6 @@ func buildIndexEntry(mftNum uint64, fnKey []byte) []byte {
 
 // insertIndexEntry inserts a new index entry before the last-entry sentinel.
 func insertIndexEntry(hdr []byte, entry []byte) ([]byte, error) {
-	// Find the last-entry sentinel.
 	entriesOff := int(binary.LittleEndian.Uint32(hdr[0:]))
 	indexLen := int(binary.LittleEndian.Uint32(hdr[4:]))
 	if entriesOff > len(hdr) || indexLen > len(hdr) {
@@ -303,13 +721,11 @@ func insertIndexEntry(hdr []byte, entry []byte) ([]byte, error) {
 		return nil, fmt.Errorf("index has no last-entry sentinel")
 	}
 
-	// Insert new entry at sentinelOff.
 	newHdr := make([]byte, len(hdr)+len(entry))
 	copy(newHdr, hdr[:sentinelOff])
 	copy(newHdr[sentinelOff:], entry)
 	copy(newHdr[sentinelOff+len(entry):], hdr[sentinelOff:])
 
-	// Update INDEX_HEADER lengths.
 	newIndexLen := indexLen + len(entry)
 	binary.LittleEndian.PutUint32(newHdr[4:], uint32(newIndexLen))
 	binary.LittleEndian.PutUint32(newHdr[8:], uint32(newIndexLen))
