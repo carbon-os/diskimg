@@ -9,6 +9,7 @@ import (
 	"github.com/carbon-os/diskimg/fat32"
 	"github.com/carbon-os/diskimg/fs"
 	"github.com/carbon-os/diskimg/fs/fstype"
+	"github.com/carbon-os/diskimg/ntfs"
 	"github.com/carbon-os/diskimg/xfs"
 )
 
@@ -32,9 +33,6 @@ func (img *Image) Mount(index int, opts ...MountOptions) (fs.Volume, error) {
 		opt = opts[0]
 	}
 
-	// Return cached mount only when the subvol request matches what was cached.
-	// For simplicity we cache the base volume only; subvol volumes are cheap to
-	// re-derive and callers rarely open the same subvol twice.
 	if opt.Subvol == "" {
 		if v, ok := img.mounts[index]; ok {
 			return v, nil
@@ -74,6 +72,9 @@ func (img *Image) Mount(index int, opts ...MountOptions) (fs.Volume, error) {
 	case fstype.XFS:
 		vol, err = xfs.Open(img.f, region.Start, region.Size())
 
+	case fstype.NTFS:
+		vol, err = ntfs.Open(img.f, region.Start, region.Size())
+
 	case fstype.FAT32, fstype.FAT16, fstype.FAT12:
 		vol, err = fat32.Open(img.f, region.Start, region.Size(), ft)
 
@@ -84,7 +85,6 @@ func (img *Image) Mount(index int, opts ...MountOptions) (fs.Volume, error) {
 		return nil, fmt.Errorf("mount partition %d: %w", index, err)
 	}
 
-	// Only cache the base (no-subvol) mount to avoid stale subvol handles.
 	if opt.Subvol == "" {
 		img.mounts[index] = vol
 	}

@@ -8,6 +8,7 @@ const (
 	Ext4    Type = "ext4"
 	Btrfs   Type = "btrfs"
 	XFS     Type = "xfs"
+	NTFS    Type = "ntfs"
 	FAT32   Type = "fat32"
 	FAT16   Type = "fat16"
 	FAT12   Type = "fat12"
@@ -17,21 +18,21 @@ const (
 // Detect reads magic bytes via the supplied reader to identify the
 // filesystem occupying the partition.  readAt mirrors io.ReaderAt.
 func Detect(readAt func(off int64, buf []byte) error) Type {
-	// ── Btrfs ───────────────────────────────────────────────────────────
+	// ── Btrfs ────────────────────────────────────────────────────────────────
 	// Primary superblock at 0x10000; magic "_BHRfS_M" at +0x40.
 	var bm [8]byte
 	if readAt(0x10040, bm[:]) == nil && string(bm[:]) == "_BHRfS_M" {
 		return Btrfs
 	}
 
-	// ── ext4 ────────────────────────────────────────────────────────────
+	// ── ext4 ─────────────────────────────────────────────────────────────────
 	// Superblock starts at byte 1024; magic uint16-LE is at +56 → byte 1080.
 	var m [2]byte
 	if readAt(1080, m[:]) == nil && m[0] == 0x53 && m[1] == 0xEF {
 		return Ext4
 	}
 
-	// ── XFS ─────────────────────────────────────────────────────────────
+	// ── XFS ──────────────────────────────────────────────────────────────────
 	// Primary superblock at byte 0; magic "XFSB" (0x58465342), big-endian.
 	var xm [4]byte
 	if readAt(0, xm[:]) == nil &&
@@ -39,7 +40,14 @@ func Detect(readAt func(off int64, buf []byte) error) Type {
 		return XFS
 	}
 
-	// ── FAT family ──────────────────────────────────────────────────────
+	// ── NTFS ─────────────────────────────────────────────────────────────────
+	// Boot sector OEM ID field (offset 3, 8 bytes) is "NTFS    " (4 spaces).
+	var oem [8]byte
+	if readAt(3, oem[:]) == nil && string(oem[:]) == "NTFS    " {
+		return NTFS
+	}
+
+	// ── FAT family ───────────────────────────────────────────────────────────
 	// Boot sector validity: bytes 510-511 must be 55 AA.
 	var sig [2]byte
 	if readAt(510, sig[:]) != nil || sig[0] != 0x55 || sig[1] != 0xAA {

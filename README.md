@@ -2,8 +2,9 @@
 
 A Go library and CLI for reading and writing disk image files without mounting
 them via the OS. Supports GPT and MBR partition tables and provides a unified
-filesystem API across ext4, Btrfs, XFS, and FAT variants. Includes a GPT image
-builder and low-level filesystem formatters for creating new images from scratch.
+filesystem API across ext4, Btrfs, XFS, FAT variants, and NTFS. Includes a GPT
+image builder and low-level filesystem formatters for creating new images from
+scratch.
 
 ---
 
@@ -31,7 +32,7 @@ builder and low-level filesystem formatters for creating new images from scratch
 | FAT16      | ✓    | ✓     |        |
 | FAT12      | ✓    | ✓     |        |
 | exFAT      |      |       | ✓      |
-| NTFS       |      |       | ✓      |
+| NTFS       | ✓    | ✓     | ✓      |
 
 ---
 
@@ -110,7 +111,7 @@ target, err := vol.Readlink("/etc/localtime")
 vi, err := vol.StatFS()
 fmt.Printf("used %d of %d bytes\n", vi.UsedBytes, vi.TotalBytes)
 
-fmt.Println(vol.Type()) // "ext4", "btrfs", "xfs", ...
+fmt.Println(vol.Type()) // "ext4", "btrfs", "xfs", "ntfs", ...
 ```
 
 ### Writing to a volume
@@ -170,6 +171,48 @@ vol.MkdirAll("/opt/myapp", 0755)
 vol.Unmount()
 
 img.Detach("patched.img") // base.img is left untouched
+```
+
+### Reading and writing an NTFS volume
+
+NTFS partitions are mounted and used through the same `Volume` API as every
+other filesystem — no special cases required.
+
+```go
+img, err := diskimg.Attach("windows.img")
+if err != nil {
+    log.Fatal(err)
+}
+
+vol, err := img.Mount(2) // NTFS partition
+if err != nil {
+    log.Fatal(err)
+}
+defer vol.Unmount()
+
+// Read
+data, err := vol.ReadFile("/Windows/System32/drivers/etc/hosts")
+
+entries, err := vol.ReadDir("/Users")
+for _, e := range entries {
+    fmt.Println(e.Name(), e.IsDir())
+}
+
+vi, err := vol.StatFS()
+fmt.Printf("used %d of %d bytes\n", vi.UsedBytes, vi.TotalBytes)
+
+// Write
+err = vol.MkdirAll("/tools/myapp", 0755)
+err = vol.WriteFile("/tools/myapp/config.ini", []byte("[main]\nkey=value\n"), 0644)
+
+f, err := vol.OpenFile("/tools/myapp/app.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+defer f.Close()
+f.Write([]byte("started\n"))
+
+err = vol.Rename("/tools/myapp/config.ini", "/tools/myapp/config.bak")
+err = vol.RemoveAll("/tools/myapp/old")
+
+img.Detach("windows-patched.img")
 ```
 
 ---
@@ -339,6 +382,8 @@ func main() {
 
 ### Full example — dual-partition Windows image
 
+Format, mount, and write files to an NTFS partition in a single workflow.
+
 ```go
 package main
 
@@ -380,6 +425,18 @@ func main() {
     if err := ntfs.Format(rawData, data.SizeBytes, ntfs.Options{Label: "WINDOWS"}); err != nil {
         log.Fatal(err)
     }
+
+    // Mount the NTFS partition and populate it through the Volume API.
+    vol, err := img.Mount(data.Index)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer vol.Unmount()
+
+    vol.MkdirAll("/Windows/System32", 0755)
+    vol.MkdirAll("/Users/Default", 0755)
+    vol.WriteFile("/Windows/System32/drivers/etc/hosts",
+        []byte("127.0.0.1 localhost\n"), 0644)
 
     img.Detach("windows.img")
 }
@@ -442,15 +499,20 @@ Partition 2: Start: 0000630194176, Size: 1073741824 bytes | GUID: 0FC63DAF-...
 ### Examples
 
 ```bash
-diskimg ubuntu.img  --info
-diskimg ubuntu.img  --fs ls /
-diskimg fedora.img  --fs ls / --partition 2
-diskimg fedora.img  --fs ls /var --partition 2 --subvol root
-diskimg fedora.img  --fs cat /etc/os-release --partition 2 --subvol root
-diskimg fedora.img  --fs subvols . --partition 2
-diskimg ubuntu.img  --fs put ./myfile /etc/myfile --partition 1
-diskimg ubuntu.img  --fs mkdir /etc/myapp --partition 1
-diskimg ubuntu.img  --fs rm /etc/myapp --partition 1
+diskimg ubuntu.img   --info
+diskimg ubuntu.img   --fs ls /
+diskimg fedora.img   --fs ls / --partition 2
+diskimg fedora.img   --fs ls /var --partition 2 --subvol root
+diskimg fedora.img   --fs cat /etc/os-release --partition 2 --subvol root
+diskimg fedora.img   --fs subvols . --partition 2
+diskimg ubuntu.img   --fs put ./myfile /etc/myfile --partition 1
+diskimg ubuntu.img   --fs mkdir /etc/myapp --partition 1
+diskimg ubuntu.img   --fs rm /etc/myapp --partition 1
+diskimg windows.img  --fs ls /Windows/System32 --partition 2
+diskimg windows.img  --fs cat "/Windows/System32/drivers/etc/hosts" --partition 2
+diskimg windows.img  --fs put ./setup.exe /tools/setup.exe --partition 2
+diskimg windows.img  --fs mkdir /tools/myapp --partition 2
+diskimg windows.img  --fs rm /tools/old --partition 2
 ```
 
 ---
@@ -474,6 +536,9 @@ diskimg/
 │   ├── partition.go    — Partition struct
 │   ├── gpt/gpt.go      — GPT parser
 │   └── mbr/mbr.go      — MBR parser
+│
+├── ntfs/               — NTFS Volume driver (read + write)
+│   └── ntfs.go         — Open(), implements fs.Volume
 │
 └── mkfs/
     ├── ext4/
@@ -516,6 +581,12 @@ diskimg/
 `Attach` and `NewBuilder` are the two entry points. `Attach` parses an existing
 image; `NewBuilder` creates a fresh one. Both produce an `*Image` whose `Mount`
 method uses `fstype.Detect` to pick the right driver and return a `Volume`.
+
+The top-level `ntfs` package provides a full read/write `Volume` driver. It is
+independent of the `mkfs/ntfs` formatter — the formatter creates a blank NTFS
+volume in a single sequential pass, while the driver handles live MFT traversal,
+attribute reads and writes, and directory management on any NTFS partition,
+whether newly formatted or pre-existing.
 
 The `mkfs` subpackages are entirely independent of the rest of the library —
 their only dependency is the standard library (plus `github.com/google/uuid` in
