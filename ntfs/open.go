@@ -258,22 +258,6 @@ func (v *ntfsVolume) getRecord(n uint64) ([]byte, error) {
 	return rec, nil
 }
 
-// putRecord writes rec to MFT slot n after re-encoding the USA, and updates
-// the in-memory cache with the non-stamped copy.
-func (v *ntfsVolume) putRecord(n uint64, rec []byte) error {
-	encoded := make([]byte, len(rec))
-	copy(encoded, rec)
-	stampUSA(encoded, int(v.recSize/512))
-	if _, err := v.partWrite(encoded, v.mftOff+int64(n)*v.recSize); err != nil {
-		return fmt.Errorf("write MFT record %d: %w", n, err)
-	}
-	v.mu.Lock()
-	v.mftCache[n] = rec
-	v.dirty = true
-	v.mu.Unlock()
-	return nil
-}
-
 // ── Update Sequence Array ─────────────────────────────────────────────────────
 
 // applyUSA undoes the sector-end stamps so the record is readable.
