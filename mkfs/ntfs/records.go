@@ -1,3 +1,4 @@
+// records.go
 package ntfs
 
 import "time"
@@ -68,7 +69,7 @@ func buildRec1(l *fsLayout, t time.Time) *mftRecord {
 
 	r.appendResident(attrStandardInfo, buildStdInfo(t, faHidden|faSystem))
 
-	dataSize := int64(4 * mftRecordSize) // mirror holds first 4 MFT records
+	dataSize := int64(4 * mftRecordSize)
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		l.mftMirrClusters*l.clusterSize, dataSize, faHidden|faSystem, "$MFTMirr"))
 
@@ -105,12 +106,10 @@ func buildRec3(l *fsLayout, t time.Time, label string) *mftRecord {
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		0, 0, faHidden|faSystem, "$Volume"))
 
-	// $VOLUME_NAME — may be empty if no label supplied.
 	if label != "" {
 		r.appendResident(attrVolumeName, toUTF16LE(label))
 	}
 
-	// $VOLUME_INFORMATION — NTFS version 3.1.
 	r.appendResident(attrVolumeInfo, buildVolumeInfoAttr())
 
 	return r
@@ -145,7 +144,6 @@ func buildRec5(l *fsLayout, t time.Time) *mftRecord {
 	r.appendResident(attrFileName,
 		buildFileName(selfRef, t, 0, 0, faArchive, "."))
 
-	// $INDEX_ROOT for $I30 (filename index), empty directory.
 	indexAllocSize := l.clusterSize
 	if indexAllocSize < 4096 {
 		indexAllocSize = 4096
@@ -156,7 +154,10 @@ func buildRec5(l *fsLayout, t time.Time) *mftRecord {
 	} else {
 		clustersPerIdx = uint8(4096 / l.clusterSize)
 	}
-	r.appendResident(attrIndexRoot, buildIndexRoot(indexAllocSize, clustersPerIdx))
+	// $INDEX_ROOT must be named "$I30" — NTFS drivers locate the directory's
+	// filename index by this name. An unnamed $INDEX_ROOT is invisible to
+	// Windows Boot Manager, macOS, and every other standard NTFS driver.
+	r.appendResidentNamed(attrIndexRoot, "$I30", buildIndexRoot(indexAllocSize, clustersPerIdx))
 
 	return r
 }
@@ -189,7 +190,6 @@ func buildRec7(l *fsLayout, t time.Time) *mftRecord {
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		bootDataSize, bootDataSize, faHidden|faSystem, "$Boot"))
 
-	// $DATA points to LCN 0 (the start of the volume).
 	r.appendNonResident(attrData, 0, l.bootClusters, l.clusterSize, bootDataSize)
 
 	return r
@@ -205,7 +205,6 @@ func buildRec8(l *fsLayout, t time.Time) *mftRecord {
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		0, 0, faHidden|faSystem, "$BadClus"))
 
-	// Empty unnamed data stream
 	r.appendResident(attrData, nil)
 
 	return r
@@ -221,7 +220,6 @@ func buildRec9(l *fsLayout, t time.Time) *mftRecord {
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		0, 0, faHidden|faSystem, "$Secure"))
 
-	// For a basic format without advanced security descriptors, leaving it minimal.
 	r.appendResident(attrData, nil)
 
 	return r
@@ -234,7 +232,7 @@ func buildRec10(l *fsLayout, t time.Time) *mftRecord {
 
 	r.appendResident(attrStandardInfo, buildStdInfo(t, faHidden|faSystem))
 
-	dataSize := int64(131072) // 128KB upcase table
+	dataSize := int64(131072)
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		l.upcaseClusters*l.clusterSize, dataSize, faHidden|faSystem, "$UpCase"))
 
@@ -254,7 +252,6 @@ func buildRec11(l *fsLayout, t time.Time) *mftRecord {
 	r.appendResident(attrFileName, buildFileName(rootDirRef, t,
 		0, 0, faHidden|faSystem, "$Extend"))
 
-	// Minimal index root for directory
 	indexAllocSize := l.clusterSize
 	if indexAllocSize < 4096 {
 		indexAllocSize = 4096
@@ -265,7 +262,7 @@ func buildRec11(l *fsLayout, t time.Time) *mftRecord {
 	} else {
 		clustersPerIdx = uint8(4096 / l.clusterSize)
 	}
-	r.appendResident(attrIndexRoot, buildIndexRoot(indexAllocSize, clustersPerIdx))
+	r.appendResidentNamed(attrIndexRoot, "$I30", buildIndexRoot(indexAllocSize, clustersPerIdx))
 
 	return r
 }
@@ -273,6 +270,5 @@ func buildRec11(l *fsLayout, t time.Time) *mftRecord {
 // ── Free Records (12-23) ─────────────────────────────────────────────────────
 
 func buildFreeRecord(recNum uint32) *mftRecord {
-	// Flags = 0 means not in use. Sequence number initialized to 0.
 	return newMFTRecord(recNum, 0, 0, 0)
 }

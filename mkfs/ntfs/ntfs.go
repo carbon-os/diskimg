@@ -1,3 +1,4 @@
+// ntfs.go
 package ntfs
 
 import (
@@ -102,7 +103,25 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// 5. Write Upcase Table
+	// 5. Write $LogFile filled with 0xFF.
+	//
+	// An all-zero $LogFile is misinterpreted by NTFS drivers as a corrupted
+	// but previously-written log rather than a clean uninitialized one.
+	// Filling with 0xFF bytes matches the NTFS_FFFF_SIGNATURE sentinel that
+	// drivers (Windows, Linux ntfs3, macOS) recognise as "never written" and
+	// handle gracefully by treating the log as clean.
+	logFileFill := make([]byte, l.logFileClusters*l.clusterSize)
+	for i := range logFileFill {
+		logFileFill[i] = 0xFF
+	}
+	if _, err := rw.Seek(l.logFileLCN*l.clusterSize, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := rw.Write(logFileFill); err != nil {
+		return err
+	}
+
+	// 6. Write Upcase Table
 	upcase := buildUpcaseTable()
 	if _, err := rw.Seek(l.upcaseLCN*l.clusterSize, io.SeekStart); err != nil {
 		return err
@@ -111,7 +130,7 @@ func Format(rw io.ReadWriteSeeker, sizeBytes int64, opts Options) error {
 		return err
 	}
 
-	// 6. Write $Bitmap — marks all system clusters as in-use so the driver
+	// 7. Write $Bitmap — marks all system clusters as in-use so the driver
 	//    never allocates over the boot sector, MFT, or other metadata.
 	bitmap := buildBitmap(&l)
 	if _, err := rw.Seek(l.bitmapLCN*l.clusterSize, io.SeekStart); err != nil {
@@ -136,13 +155,13 @@ func buildBitmap(l *fsLayout) []byte {
 		}
 	}
 
-	markRange(0,             l.bootClusters)    // LCN 0:          boot sector
-	markRange(l.mftLCN,     l.mftClusters)      // $MFT
-	markRange(l.mftMirrLCN, l.mftMirrClusters)  // $MFTMirr
-	markRange(l.logFileLCN, l.logFileClusters)   // $LogFile
-	markRange(l.attrDefLCN, l.attrDefClusters)   // $AttrDef
-	markRange(l.upcaseLCN,  l.upcaseClusters)    // $UpCase
-	markRange(l.bitmapLCN,  l.bitmapClusters)    // $Bitmap itself
+	markRange(0,             l.bootClusters)   // LCN 0:          boot sector
+	markRange(l.mftLCN,     l.mftClusters)     // $MFT
+	markRange(l.mftMirrLCN, l.mftMirrClusters) // $MFTMirr
+	markRange(l.logFileLCN, l.logFileClusters)  // $LogFile
+	markRange(l.attrDefLCN, l.attrDefClusters)  // $AttrDef
+	markRange(l.upcaseLCN,  l.upcaseClusters)   // $UpCase
+	markRange(l.bitmapLCN,  l.bitmapClusters)   // $Bitmap itself
 
 	return buf
 }

@@ -1,3 +1,4 @@
+// mft.go
 package ntfs
 
 import "time"
@@ -62,7 +63,7 @@ func newMFTRecord(recNum uint32, seqNum, linkCount, flags uint16) *mftRecord {
 	}
 }
 
-// appendResident appends a resident attribute. content is padded to 8 bytes.
+// appendResident appends an unnamed resident attribute. content is padded to 8 bytes.
 func (r *mftRecord) appendResident(attrType uint32, content []byte) {
 	padded := (len(content) + 7) &^ 7
 	total := 0x18 + padded // 24-byte resident header + padded content
@@ -72,12 +73,48 @@ func (r *mftRecord) appendResident(attrType uint32, content []byte) {
 	putU32(attr[0x04:], uint32(total))
 	// attr[0x08] = 0: resident flag
 	// attr[0x09] = 0: no name
-	putU16(attr[0x0A:], 0x18) // name offset (unused; conventionally = content offset)
+	putU16(attr[0x0A:], 0x18) // name offset (conventionally points at content when no name)
 	// attr[0x0C:0x0E] flags = 0
 	putU16(attr[0x0E:], r.nextAttrID)
 	putU32(attr[0x10:], uint32(len(content))) // content length (before padding)
 	putU16(attr[0x14:], 0x18)                 // content offset from attr start
 	copy(attr[0x18:], content)
+
+	copy(r.buf[r.cursor:], attr)
+	r.cursor += total
+	r.nextAttrID++
+}
+
+// appendResidentNamed appends a named resident attribute.
+// The attribute name (e.g. "$I30") is encoded as UTF-16LE and placed between
+// the fixed header and the content, per the NTFS attribute header layout:
+//
+//	[0x00–0x17]  24-byte resident attribute header
+//	[0x18–...]   attribute name (UTF-16LE, padded to 8 bytes)
+//	[name_end–]  content (padded to 8 bytes)
+//
+// This is required for $INDEX_ROOT and related index attributes on directories,
+// which must carry the name "$I30" so that NTFS drivers can locate them.
+func (r *mftRecord) appendResidentNamed(attrType uint32, name string, content []byte) {
+	nameBytes  := toUTF16LE(name)
+	namePad    := (len(nameBytes) + 7) &^ 7
+	contentPad := (len(content) + 7) &^ 7
+	nameOff    := 0x18                 // name starts immediately after 24-byte header
+	contentOff := nameOff + namePad    // content follows padded name
+	total      := contentOff + contentPad
+
+	attr := make([]byte, total)
+	putU32(attr[0x00:], attrType)
+	putU32(attr[0x04:], uint32(total))
+	// attr[0x08] = 0: resident flag
+	attr[0x09] = byte(len(nameBytes) / 2)   // name length in UTF-16 code units
+	putU16(attr[0x0A:], uint16(nameOff))    // offset to name from start of attribute
+	// attr[0x0C:0x0E] flags = 0
+	putU16(attr[0x0E:], r.nextAttrID)
+	putU32(attr[0x10:], uint32(len(content))) // content length (before padding)
+	putU16(attr[0x14:], uint16(contentOff))   // offset to content from start of attribute
+	copy(attr[nameOff:], nameBytes)
+	copy(attr[contentOff:], content)
 
 	copy(r.buf[r.cursor:], attr)
 	r.cursor += total
@@ -228,6 +265,9 @@ func buildVolumeInfoAttr() []byte {
 //	[0x00] INDEX_ROOT_HEADER (16 bytes)
 //	[0x10] INDEX_HEADER      (16 bytes)
 //	[0x20] End INDEX_ENTRY   (16 bytes)  ← only entry: the end/last marker
+//
+// Note: this content is always written via appendResidentNamed with name "$I30"
+// so that NTFS drivers can locate the directory's filename index.
 func buildIndexRoot(indexAllocSize int64, clustersPerIdx uint8) []byte {
 	ir := make([]byte, 48)
 
