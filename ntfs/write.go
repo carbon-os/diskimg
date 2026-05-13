@@ -439,6 +439,12 @@ func updateFileName(rec []byte, name string, parentNum uint64) {
 
 // ── attribute record manipulation ─────────────────────────────────────────────
 
+func assignAttrID(rec []byte, attrOff int) {
+	nextID := binary.LittleEndian.Uint16(rec[0x28:])
+	binary.LittleEndian.PutUint16(rec[attrOff+0x0E:], nextID)
+	binary.LittleEndian.PutUint16(rec[0x28:], nextID+1)
+}
+
 func cloneRecord(rec []byte) []byte {
 	c := make([]byte, len(rec))
 	copy(c, rec)
@@ -447,7 +453,7 @@ func cloneRecord(rec []byte) []byte {
 
 func maxResidentDataSize(rec []byte) int64 {
 	usedSize := int(binary.LittleEndian.Uint32(rec[0x18:]))
-	allocSize := len(rec)
+	allocSize := int(binary.LittleEndian.Uint32(rec[0x1C:])) // FIXED: Read MFT allocation size instead of volatile slice length
 	return int64(allocSize-usedSize) - 24
 }
 
@@ -531,10 +537,12 @@ func appendResidentAttrAt(rec []byte, off int, attrType uint32, value []byte) []
 	binary.LittleEndian.PutUint32(rec[off:], uint32(attrType))
 	binary.LittleEndian.PutUint32(rec[off+4:], uint32(attrLen))
 	rec[off+8] = 0
-	binary.LittleEndian.PutUint16(rec[off+10:], 24)
 	binary.LittleEndian.PutUint32(rec[off+16:], uint32(len(value)))
 	binary.LittleEndian.PutUint16(rec[off+20:], 24)
+	
+	assignAttrID(rec, off) // FIXED: Generate Attribute ID
 	copy(rec[off+24:], value)
+	
 	endOff := off + attrLen
 	binary.LittleEndian.PutUint32(rec[endOff:], uint32(attrEND))
 	binary.LittleEndian.PutUint32(rec[endOff+4:], 0)
@@ -559,10 +567,13 @@ func appendNamedResidentAttrAt(rec []byte, off int, attrType uint32, name string
 	binary.LittleEndian.PutUint16(rec[off+10:], uint16(nameOff))
 	binary.LittleEndian.PutUint32(rec[off+16:], uint32(len(value)))
 	binary.LittleEndian.PutUint16(rec[off+20:], uint16(valOff))
+	
+	assignAttrID(rec, off) // FIXED: Generate Attribute ID
 	for i, c := range u16 {
 		binary.LittleEndian.PutUint16(rec[off+nameOff+i*2:], c)
 	}
 	copy(rec[off+valOff:], value)
+	
 	endOff := off + attrLen
 	binary.LittleEndian.PutUint32(rec[endOff:], uint32(attrEND))
 	binary.LittleEndian.PutUint32(rec[endOff+4:], 0)
@@ -584,7 +595,9 @@ func appendNonResidentAttr(rec []byte, attrType uint32, runs []run, dataSize, cl
 	binary.LittleEndian.PutUint32(rec[off:], uint32(attrType))
 	binary.LittleEndian.PutUint32(rec[off+4:], uint32(attrLen))
 	rec[off+8] = 1
-	binary.LittleEndian.PutUint16(rec[off+10:], rlOff)
+	
+	assignAttrID(rec, off) // FIXED: Generate Attribute ID
+	
 	var totalClusters int64
 	for _, r := range runs {
 		totalClusters += r.length
@@ -631,6 +644,9 @@ func appendNonResidentNamedAttr(rec []byte, attrType uint32, name string, runs [
 	rec[off+8] = 1 // non-resident
 	rec[off+9] = byte(len(u16))
 	binary.LittleEndian.PutUint16(rec[off+10:], nameOff)
+	
+	assignAttrID(rec, off) // FIXED: Generate Attribute ID
+	
 	binary.LittleEndian.PutUint64(rec[off+0x18:], uint64(totalClusters-1))
 	binary.LittleEndian.PutUint16(rec[off+0x20:], rlOff)
 	binary.LittleEndian.PutUint64(rec[off+0x28:], uint64(allocSize))
